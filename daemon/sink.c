@@ -21,6 +21,7 @@
 #include "btstack_resample.h"
 #include "btstack_ring_buffer.h"
 
+#include "btstack_audio_ios.h"
 #include "media_controls.h"
 #include "sink.h"
 #include "sink_status.h"
@@ -32,10 +33,18 @@
 #define RESAMPLE_ADDITIONAL_FRAMES     16
 #define RESAMPLE_OUTPUT_FRAMES         (SBC_MAX_AUDIO_FRAMES_PER_BLOCK + RESAMPLE_ADDITIONAL_FRAMES)
 
-// SBC frames buffered: below MIN stretch, above MAX compress
-#define OPTIMAL_FRAMES_MIN 70
-#define OPTIMAL_FRAMES_MAX 100
-#define ADDITIONAL_FRAMES  40
+// Buffering: the AudioQueue holds ~280 ms (6 x 2048 frames, btstack_audio_ios.h). The SBC
+// ring in front of it absorbs Bluetooth bursts and stalls. A tiny resampling correction keeps
+// the *total* buffered audio (AudioQueue + SBC) near TARGET_FRAMES, so clock drift between the
+// phone and the iPod neither drains nor overfills the buffers.
+#define AQ_FRAMES           (BTSTACK_AUDIO_IOS_NUM_BUFFERS * BTSTACK_AUDIO_IOS_BUFFER_FRAMES)
+#define START_FRAMES        (AQ_FRAMES + 1024)        // buffered before playback starts (~300 ms)
+#define TARGET_FRAMES       (AQ_FRAMES + 2048)        // steady-state total (~325 ms)
+#define BAND_FRAMES         3072                      // within +-70 ms of target: no correction
+#define TRIM_ABOVE_FRAMES   (TARGET_FRAMES + 22050)   // >0.5 s too much: skip ahead once
+#define SBC_STORAGE_FRAMES  512                       // ~1.5 s of SBC
+#define STATS_INTERVAL_MS   5000
+#define STATS_HEALTH_TICKS  6                         // health line every 30 s
 
 static btstack_packet_callback_registration_t hci_event_callback_registration;
 
@@ -50,9 +59,16 @@ static uint8_t media_sbc_codec_capabilities[] = { 0xFF, 0xFF, 2, 53 };
 static const btstack_sbc_decoder_t *   sbc_decoder_instance;
 static btstack_sbc_decoder_bluedroid_t sbc_decoder_context;
 
-static uint8_t sbc_frame_storage[(OPTIMAL_FRAMES_MAX + ADDITIONAL_FRAMES) * MAX_SBC_FRAME_SIZE];
+static uint8_t sbc_frame_storage[SBC_STORAGE_FRAMES * MAX_SBC_FRAME_SIZE];
 static btstack_ring_buffer_t sbc_frame_ring_buffer;
 static unsigned int sbc_frame_size;
+static unsigned int pcm_frames_per_sbc_frame = 128;
+static int32_t      total_avg;              // smoothed total buffered frames
+static uint32_t     stat_dropped_sbc;
+static uint32_t     stat_trims;
+static uint32_t     stat_underruns_seen;
+static unsigned int stat_ticks;
+static btstack_timer_source_t stats_timer;
 
 static uint8_t decoded_audio_storage[RESAMPLE_OUTPUT_FRAMES * BYTES_PER_FRAME];
 static btstack_ring_buffer_t decoded_audio_ring_buffer;
@@ -404,6 +420,52 @@ static void handle_pcm_data(int16_t * data, int num_audio_frames, int num_channe
     }
 }
 
+static uint32_t sbc_frames_buffered(void){
+    if (sbc_frame_size == 0) return 0;
+    return btstack_ring_buffer_bytes_available(&sbc_frame_ring_buffer) / sbc_frame_size;
+}
+
+// PCM frames the playback handler can deliver right now (before resampling)
+static uint32_t sink_pcm_frames_available(void){
+    return sbc_frames_buffered() * pcm_frames_per_sbc_frame
+         + btstack_ring_buffer_bytes_available(&decoded_audio_ring_buffer) / BYTES_PER_FRAME;
+}
+
+static void drop_sbc_frames(uint32_t frames){
+    uint8_t  scratch[MAX_SBC_FRAME_SIZE];
+    uint32_t bytes_read;
+    while (frames-- && sbc_frame_size && btstack_ring_buffer_bytes_available(&sbc_frame_ring_buffer) >= sbc_frame_size){
+        btstack_ring_buffer_read(&sbc_frame_ring_buffer, scratch, sbc_frame_size, &bytes_read);
+        stat_dropped_sbc++;
+    }
+}
+
+static uint32_t frames_to_ms(int32_t frames){
+    uint32_t rate = a2dp_connection.sbc_configuration.sampling_frequency;
+    if (rate == 0 || frames <= 0) return 0;
+    return (uint32_t) frames * 1000u / rate;
+}
+
+// summarized instead of one log line per event: logging on this thread costs audio time
+static void stats_timer_handler(btstack_timer_source_t * ts){
+    uint32_t underruns = btstack_audio_ios_get_underruns();
+    if (underruns < stat_underruns_seen) stat_underruns_seen = 0;     // stream restarted
+    uint32_t new_underruns = underruns - stat_underruns_seen;
+    stat_underruns_seen = underruns;
+    stat_ticks++;
+    int problems = new_underruns || stat_dropped_sbc || stat_trims;
+    if (audio_stream_started && (problems || stat_ticks % STATS_HEALTH_TICKS == 0)){
+        int32_t total = (int32_t) (sink_pcm_frames_available() + btstack_audio_ios_get_queued_frames());
+        log_info("audio: %s last %u s: %u dropouts, %u SBC frames dropped, %u skips; buffered %u ms",
+                 problems ? "PROBLEMS" : "ok,", STATS_INTERVAL_MS / 1000, new_underruns,
+                 stat_dropped_sbc, stat_trims, frames_to_ms(total));
+    }
+    stat_dropped_sbc = 0;
+    stat_trims = 0;
+    btstack_run_loop_set_timer(ts, STATS_INTERVAL_MS);
+    btstack_run_loop_add_timer(ts);
+}
+
 static void media_processing_init(media_codec_configuration_sbc_t * configuration){
     if (media_initialized) return;
     sbc_decoder_instance = btstack_sbc_decoder_bluedroid_init_instance(&sbc_decoder_context);
@@ -414,18 +476,33 @@ static void media_processing_init(media_codec_configuration_sbc_t * configuratio
     btstack_resample_init(&resample_instance, configuration->num_channels);
     resampling_min_factor = btstack_resample_get_min_factor_for_output_capacity(SBC_MAX_AUDIO_FRAMES_PER_BLOCK, RESAMPLE_OUTPUT_FRAMES);
 
+    unsigned int blocks = configuration->block_length;
+    unsigned int bands  = configuration->subbands;
+    pcm_frames_per_sbc_frame = (blocks >= 4 && blocks <= 16 && (bands == 4 || bands == 8)) ? blocks * bands : 128;
+    sbc_frame_size = 0;
+
     if (audio_sink){
         audio_sink->init(NUM_CHANNELS, configuration->sampling_frequency, &playback_handler);
         audio_sink->set_volume(volume_percentage * 127 / 100);
     }
+    btstack_audio_ios_set_available_handler(&sink_pcm_frames_available);
     audio_stream_started = 0;
     media_initialized = 1;
+
+    stat_dropped_sbc = stat_trims = stat_underruns_seen = 0;
+    stat_ticks = 0;
+    btstack_run_loop_remove_timer(&stats_timer);
+    btstack_run_loop_set_timer_handler(&stats_timer, &stats_timer_handler);
+    btstack_run_loop_set_timer(&stats_timer, STATS_INTERVAL_MS);
+    btstack_run_loop_add_timer(&stats_timer);
 }
 
 static void media_processing_start(void){
     if (!media_initialized) return;
-    if (audio_sink) audio_sink->start_stream();
     audio_stream_started = 1;
+    total_avg = (int32_t) sink_pcm_frames_available();
+    log_info("audio: starting playback with %u ms buffered", frames_to_ms(total_avg));
+    if (audio_sink) audio_sink->start_stream();
 }
 
 static void media_processing_pause(void){
@@ -441,6 +518,7 @@ static void media_processing_close(void){
     media_initialized = 0;
     audio_stream_started = 0;
     sbc_frame_size = 0;
+    btstack_run_loop_remove_timer(&stats_timer);
     if (audio_sink) audio_sink->close();
 }
 
@@ -470,32 +548,50 @@ static void handle_l2cap_media_data_packet(uint8_t seid, uint8_t * packet, uint1
     int packet_length = size - pos;
     uint8_t * packet_begin = packet + pos;
 
-    sbc_frame_size = packet_length / num_frames;
-    if (sbc_frame_size == 0 || sbc_frame_size > MAX_SBC_FRAME_SIZE){
-        sbc_frame_size = 0;
-        return;
-    }
-    if (btstack_ring_buffer_write(&sbc_frame_ring_buffer, packet_begin, packet_length) != ERROR_CODE_SUCCESS){
-        log_error("SBC ring buffer full");
+    unsigned int frame_size = packet_length / num_frames;
+    if (frame_size == 0 || frame_size > MAX_SBC_FRAME_SIZE) return;
+    if (frame_size != sbc_frame_size){
+        // the phone changed the bitpool: buffered frames of the old size would be misparsed
+        if (sbc_frame_size){
+            log_info("audio: SBC frame size %u -> %u, flushing %u frames", sbc_frame_size, frame_size, sbc_frames_buffered());
+            btstack_ring_buffer_reset(&sbc_frame_ring_buffer);
+        }
+        sbc_frame_size = frame_size;
     }
 
-    // keep buffer level in the optimal window by resampling a tiny bit
-    int sbc_frames_in_buffer = btstack_ring_buffer_bytes_available(&sbc_frame_ring_buffer) / sbc_frame_size;
+    // never lose the newest audio: if the ring is full, drop the oldest frames instead
+    if (btstack_ring_buffer_bytes_free(&sbc_frame_ring_buffer) < (uint32_t) packet_length){
+        drop_sbc_frames((packet_length + frame_size - 1) / frame_size);
+    }
+    btstack_ring_buffer_write(&sbc_frame_ring_buffer, packet_begin, packet_length);
+
+    if (!audio_stream_started){
+        if (sink_pcm_frames_available() >= START_FRAMES) media_processing_start();
+        return;
+    }
+
+    // keep the total buffered audio (SBC + AudioQueue) near the target
+    int32_t total = (int32_t) (sink_pcm_frames_available() + btstack_audio_ios_get_queued_frames());
+    total_avg += (total - total_avg) / 16;
+    if (total_avg > TRIM_ABOVE_FRAMES){
+        // far too much (the phone caught up in a burst after a long stall):
+        // skip ahead once instead of carrying the extra delay
+        drop_sbc_frames((uint32_t) (total_avg - TARGET_FRAMES) / pcm_frames_per_sbc_frame);
+        stat_trims++;
+        total_avg = (int32_t) (sink_pcm_frames_available() + btstack_audio_ios_get_queued_frames());
+    }
     const uint32_t nominal_factor = 0x10000;
-    const uint32_t compensation   = 0x00100;
-    uint32_t resampling_factor;
-    if (sbc_frames_in_buffer < OPTIMAL_FRAMES_MIN){
-        resampling_factor = nominal_factor - compensation;
-    } else if (sbc_frames_in_buffer <= OPTIMAL_FRAMES_MAX){
-        resampling_factor = nominal_factor;
-    } else {
-        resampling_factor = nominal_factor + compensation;
+    const uint32_t compensation   = 0x00100;     // 0.4 %: inaudible
+    uint32_t resampling_factor = nominal_factor;
+    if (total_avg < TARGET_FRAMES - BAND_FRAMES){
+        resampling_factor = nominal_factor - compensation;      // running low: stretch
+    } else if (total_avg > TARGET_FRAMES + BAND_FRAMES){
+        resampling_factor = nominal_factor + compensation;      // too much: compress
     }
     btstack_resample_set_factor(&resample_instance, btstack_max(resampling_factor, resampling_min_factor));
 
-    if (!audio_stream_started && sbc_frames_in_buffer >= OPTIMAL_FRAMES_MIN){
-        media_processing_start();
-    }
+    // AudioQueue buffers may be waiting for exactly this data
+    btstack_audio_ios_kick();
 }
 
 // --- volume ---
@@ -593,6 +689,8 @@ static void a2dp_sink_packet_handler(uint8_t packet_type, uint16_t channel, uint
             sink_status_set_state(SINK_STATE_CONNECTED);
             sink_status_set_remote(bd_addr_to_str(address), "");
             gap_remote_name_request(address, 0x01, 0);
+            // connected: stop inquiry scanning, it steals radio time from the audio link
+            gap_discoverable_control(0);
             media_apply_active();
             break;
 
@@ -658,6 +756,7 @@ static void a2dp_sink_packet_handler(uint8_t packet_type, uint16_t channel, uint
             cur_title[0] = 0;
             cur_artist[0] = 0;
             media_apply_active();
+            gap_discoverable_control(1);       // findable again for pairing
             sink_status_set_state(SINK_STATE_READY);
             break;
 

@@ -87,7 +87,7 @@ Then, inside this folder:
 make package FINALPACKAGE=1
 ```
 
-This produces `packages/local.a2dpsink_0.4.1_iphoneos-arm.deb`.
+This produces `packages/local.a2dpsink_0.4.2_iphoneos-arm.deb`.
 
 ## Install
 
@@ -131,6 +131,17 @@ kept awake. The screen can turn off, but the device won't sleep, so keep it plug
   from the receiver: if it can't start on your iPod (or crashes), it switches itself
   off, the app shows a warning, and Bluetooth audio keeps working.
 - **Name** and **Forget Paired Devices**.
+
+## Audio quality tips
+
+- **Turn Wi-Fi off on the iPod in the car.** The iPod touch 5 uses one Broadcom chip and
+  antenna for both Wi-Fi and Bluetooth; Wi-Fi scanning steals air time from the audio link.
+- The receiver keeps about **0.3 s of audio buffered** (more than a typical speaker), so a
+  short Bluetooth hiccup or iOS's power saving with the screen locked doesn't cause a
+  dropout. Pause/play therefore takes effect about 0.3 s later.
+- Every 30 s the log has a health line, e.g.
+  `audio: ok, last 5 s: 0 dropouts, 0 SBC frames dropped, 0 skips; buffered 330 ms`.
+  Lines marked `PROBLEMS` mean real dropouts; send those if audio still breaks up.
 
 ## If it doesn't work
 

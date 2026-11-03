@@ -3,16 +3,28 @@
  *
  * btstack_audio_sink_t on top of AudioQueue (iOS 6 - 9).
  *
- * Threading: BTstack is single threaded (posix run loop on the main thread). AudioQueue
- * calls us on its own thread. A timer on the BTstack run loop pulls PCM from the A2DP
- * code via the playback callback and pushes it into a single-producer/single-consumer
- * ring buffer; the AudioQueue callback only copies from that ring. Same model as
- * BTstack's PortAudio driver.
+ * Buffering: the AudioQueue itself holds the output buffer, NUM_BUFFERS x BUFFER_FRAMES
+ * (6 x 2048 frames, ~280 ms at 44.1 kHz). With the screen locked iOS saves power by
+ * rendering in 4096-frame cycles (~93 ms); the previous 4 x 1024 queue could not cover a
+ * single such cycle, so every cycle ran dry, incoming audio piled up and was dropped.
+ *
+ * Threading: buffers are filled (SBC decode + resample through the playback callback) and
+ * enqueued on the BTstack thread. The AudioQueue callback runs on Core Audio's real-time
+ * thread; it only hands the played buffer back through a lock-free queue and wakes the
+ * BTstack thread with a byte on a pipe. No polling timer: a buffer is refilled as soon as
+ * it is free, whatever iOS does to timers while the screen is off.
+ *
+ * A buffer is only filled when enough audio is buffered (available handler). After a
+ * Bluetooth stall the queue runs dry once, refills a few buffers' worth and resumes
+ * cleanly, instead of crackling with half-empty buffers.
  */
 
 #include "btstack_config.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <string.h>
+#include <unistd.h>
 #include <AudioToolbox/AudioToolbox.h>
 
 #include "btstack_audio.h"
@@ -22,86 +34,126 @@
 
 #include "btstack_audio_ios.h"
 
-#define MAX_CHANNELS          2
-#define FRAMES_PER_CHUNK      256      // what we ask the A2DP code for at a time
-#define FRAMES_PER_AQ_BUFFER  1024     // ~23 ms at 44.1 kHz
-#define NUM_AQ_BUFFERS        4
-#define RING_FRAMES           8192     // power of two, ~186 ms at 44.1 kHz
-#define RING_TARGET_FRAMES    (FRAMES_PER_AQ_BUFFER * 3 + FRAMES_PER_CHUNK)
-#define FILL_TIMER_MS         5
+#define MAX_CHANNELS        2
+#define NUM_BUFFERS         BTSTACK_AUDIO_IOS_NUM_BUFFERS
+#define BUFFER_FRAMES       BTSTACK_AUDIO_IOS_BUFFER_FRAMES
+#define FREE_QUEUE_SIZE     8       // power of two, > NUM_BUFFERS
+#define AVAILABLE_MARGIN    256     // resampling can need a few more input frames
+#define REBUFFER_BUFFERS    3       // after running dry, wait for this much audio
+#define FALLBACK_TIMER_MS   40      // belt and braces; the pipe does the real work
 
 static void (*playback_callback)(int16_t * buffer, uint16_t num_samples, const btstack_audio_context_t * context);
+static uint32_t (*available_handler)(void);
 
 static AudioQueueRef       queue;
-static AudioQueueBufferRef aq_buffers[NUM_AQ_BUFFERS];
+static AudioQueueBufferRef aq_buffers[NUM_BUFFERS];
+static AudioStreamBasicDescription stream_format;
 static uint32_t            sample_rate;
 static uint8_t             num_channels;
-static volatile int        stream_running;
-static AudioStreamBasicDescription stream_format;
 static float               queue_volume = 1.0f;
+static volatile int        stream_running;
 
-static btstack_timer_source_t fill_timer;
+// played buffers: single producer (AudioQueue thread), single consumer (BTstack thread)
+static AudioQueueBufferRef free_queue[FREE_QUEUE_SIZE];
+static volatile uint32_t   free_write;
+static volatile uint32_t   free_read;
+static AudioQueueBufferRef held_buffer;      // taken from free_queue, waiting for audio
+static volatile int32_t    frames_queued;    // handed to the AudioQueue, not played yet
+static int                 primed;           // at least one buffer was played
+static int                 rebuffering;
+static uint32_t            underruns;
 
-// SPSC ring: written on BTstack thread, read on AudioQueue thread
-static int16_t           ring[RING_FRAMES * MAX_CHANNELS];
-static volatile uint32_t ring_write;   // frames written (monotonic)
-static volatile uint32_t ring_read;    // frames read (monotonic)
+static int                    wake_pipe[2] = { -1, -1 };
+static btstack_data_source_t  wake_data_source;
+static btstack_timer_source_t fallback_timer;
 
-static uint32_t load_acquire(volatile uint32_t * p){ return __atomic_load_n(p, __ATOMIC_ACQUIRE); }
-static void store_release(volatile uint32_t * p, uint32_t v){ __atomic_store_n(p, v, __ATOMIC_RELEASE); }
-
-static uint32_t ring_fill(void){
-    return load_acquire(&ring_write) - load_acquire(&ring_read);
+static AudioQueueBufferRef free_queue_pop(void){
+    uint32_t r = free_read;
+    if (r == __atomic_load_n(&free_write, __ATOMIC_ACQUIRE)) return NULL;
+    AudioQueueBufferRef b = free_queue[r & (FREE_QUEUE_SIZE - 1)];
+    __atomic_store_n(&free_read, r + 1, __ATOMIC_RELEASE);
+    return b;
 }
 
-// AudioQueue thread
+// AudioQueue (real-time) thread: no locks, no logging, no allocation
 static void aq_output_callback(void * user_data, AudioQueueRef aq, AudioQueueBufferRef buffer){
     (void) user_data;
-    if (!__atomic_load_n(&stream_running, __ATOMIC_ACQUIRE)) return;   // queue is being torn down
-    int16_t * out = (int16_t *) buffer->mAudioData;
-    uint32_t frames_wanted = FRAMES_PER_AQ_BUFFER;
-    uint32_t read  = ring_read;
-    uint32_t avail = load_acquire(&ring_write) - read;
-    uint32_t frames = btstack_min(avail, frames_wanted);
-    uint32_t i;
-    for (i = 0; i < frames; i++){
-        uint32_t pos = ((read + i) & (RING_FRAMES - 1)) * num_channels;
-        out[i * num_channels] = ring[pos];
-        if (num_channels > 1) out[i * num_channels + 1] = ring[pos + 1];
-    }
-    store_release(&ring_read, read + frames);
-    if (frames < frames_wanted){
-        // underrun: pad with silence
-        memset(&out[frames * num_channels], 0, (frames_wanted - frames) * num_channels * sizeof(int16_t));
-    }
-    buffer->mAudioDataByteSize = frames_wanted * num_channels * sizeof(int16_t);
-    AudioQueueEnqueueBuffer(aq, buffer, 0, NULL);
+    (void) aq;
+    if (!__atomic_load_n(&stream_running, __ATOMIC_ACQUIRE)) return;
+    int32_t frames = (int32_t) (buffer->mAudioDataByteSize / stream_format.mBytesPerFrame);
+    __atomic_sub_fetch(&frames_queued, frames, __ATOMIC_ACQ_REL);
+    uint32_t w = free_write;
+    free_queue[w & (FREE_QUEUE_SIZE - 1)] = buffer;
+    __atomic_store_n(&free_write, w + 1, __ATOMIC_RELEASE);
+    char c = 0;
+    ssize_t n = write(wake_pipe[1], &c, 1);    // non-blocking: a full pipe means a wake is pending
+    (void) n;
 }
 
 // BTstack thread
-static void fill_ring(void){
-    if (!playback_callback) return;
-    int16_t chunk[FRAMES_PER_CHUNK * MAX_CHANNELS];
+static int enqueue(AudioQueueBufferRef b){
     btstack_audio_context_t context;
     memset(&context, 0, sizeof(context));
-    while (ring_fill() + FRAMES_PER_CHUNK <= RING_TARGET_FRAMES){
-        (*playback_callback)(chunk, FRAMES_PER_CHUNK, &context);
-        uint32_t write = ring_write;
-        uint32_t i;
-        for (i = 0; i < FRAMES_PER_CHUNK; i++){
-            uint32_t pos = ((write + i) & (RING_FRAMES - 1)) * num_channels;
-            ring[pos] = chunk[i * num_channels];
-            if (num_channels > 1) ring[pos + 1] = chunk[i * num_channels + 1];
+    (*playback_callback)((int16_t *) b->mAudioData, BUFFER_FRAMES, &context);
+    b->mAudioDataByteSize = BUFFER_FRAMES * stream_format.mBytesPerFrame;
+    __atomic_add_fetch(&frames_queued, BUFFER_FRAMES, __ATOMIC_ACQ_REL);
+    OSStatus err = AudioQueueEnqueueBuffer(queue, b, 0, NULL);
+    if (err){
+        __atomic_sub_fetch(&frames_queued, BUFFER_FRAMES, __ATOMIC_ACQ_REL);
+        log_error("AudioQueueEnqueueBuffer failed: %d", (int) err);
+        return 0;
+    }
+    primed = 1;
+    return 1;
+}
+
+static void fill_free_buffers(void){
+    if (!__atomic_load_n(&stream_running, __ATOMIC_ACQUIRE) || !queue || !playback_callback) return;
+    while (1){
+        if (!held_buffer) held_buffer = free_queue_pop();
+        if (!held_buffer) return;
+        if (primed && !rebuffering && __atomic_load_n(&frames_queued, __ATOMIC_ACQUIRE) <= 0){
+            rebuffering = 1;    // queue ran dry: build up some audio before resuming
+            underruns++;
         }
-        store_release(&ring_write, write + FRAMES_PER_CHUNK);
+        if (available_handler){
+            uint32_t needed = BUFFER_FRAMES + AVAILABLE_MARGIN;
+            if (rebuffering) needed = REBUFFER_BUFFERS * BUFFER_FRAMES + AVAILABLE_MARGIN;
+            if ((*available_handler)() < needed) return;    // wait for more Bluetooth data
+        }
+        rebuffering = 0;
+        if (!enqueue(held_buffer)) return;
+        held_buffer = NULL;
     }
 }
 
-static void fill_timer_handler(btstack_timer_source_t * ts){
-    if (!stream_running) return;
-    fill_ring();
-    btstack_run_loop_set_timer(ts, FILL_TIMER_MS);
+static void wake_handler(btstack_data_source_t * ds, btstack_data_source_callback_type_t type){
+    (void) type;
+    char buf[16];
+    while (read(ds->source.fd, buf, sizeof(buf)) > 0) {}
+    fill_free_buffers();
+}
+
+static void fallback_timer_handler(btstack_timer_source_t * ts){
+    if (!__atomic_load_n(&stream_running, __ATOMIC_ACQUIRE)) return;
+    fill_free_buffers();
+    btstack_run_loop_set_timer(ts, FALLBACK_TIMER_MS);
     btstack_run_loop_add_timer(ts);
+}
+
+static int setup_wake_pipe(void){
+    if (wake_pipe[0] >= 0) return 0;
+    if (pipe(wake_pipe) != 0){
+        log_error("audio: pipe() failed: %s", strerror(errno));
+        return -1;
+    }
+    fcntl(wake_pipe[0], F_SETFL, fcntl(wake_pipe[0], F_GETFL) | O_NONBLOCK);
+    fcntl(wake_pipe[1], F_SETFL, fcntl(wake_pipe[1], F_GETFL) | O_NONBLOCK);
+    btstack_run_loop_set_data_source_fd(&wake_data_source, wake_pipe[0]);
+    btstack_run_loop_set_data_source_handler(&wake_data_source, &wake_handler);
+    btstack_run_loop_enable_data_source_callbacks(&wake_data_source, DATA_SOURCE_CALLBACK_READ);
+    btstack_run_loop_add_data_source(&wake_data_source);
+    return 0;
 }
 
 #pragma clang diagnostic push
@@ -132,7 +184,7 @@ static void close_queue(void){
 }
 
 static int create_queue(void){
-    // NULL run loop: callbacks on an AudioQueue-internal thread
+    // NULL run loop: callbacks on an AudioQueue-internal (real-time) thread
     OSStatus err = AudioQueueNewOutput(&stream_format, &aq_output_callback, NULL, NULL, NULL, 0, &queue);
     if (err){
         log_error("AudioQueueNewOutput failed: %d", (int) err);
@@ -140,8 +192,8 @@ static int create_queue(void){
         return -1;
     }
     int i;
-    for (i = 0; i < NUM_AQ_BUFFERS; i++){
-        err = AudioQueueAllocateBuffer(queue, FRAMES_PER_AQ_BUFFER * stream_format.mBytesPerFrame, &aq_buffers[i]);
+    for (i = 0; i < NUM_BUFFERS; i++){
+        err = AudioQueueAllocateBuffer(queue, BUFFER_FRAMES * stream_format.mBytesPerFrame, &aq_buffers[i]);
         if (err){
             log_error("AudioQueueAllocateBuffer failed: %d", (int) err);
             close_queue();
@@ -162,6 +214,7 @@ static int ios_audio_init(uint8_t channels, uint32_t samplerate,
     sample_rate = samplerate;
 
     setup_audio_session();
+    if (setup_wake_pipe()) return -1;
 
     memset(&stream_format, 0, sizeof(stream_format));
     stream_format.mSampleRate       = samplerate;
@@ -173,7 +226,8 @@ static int ios_audio_init(uint8_t channels, uint32_t samplerate,
     stream_format.mFramesPerPacket  = 1;
     stream_format.mBytesPerPacket   = stream_format.mBytesPerFrame;
 
-    log_info("audio: configured %u Hz, %u channels", samplerate, channels);
+    log_info("audio: configured %u Hz, %u channels, %u x %u frames queued",
+             samplerate, channels, NUM_BUFFERS, BUFFER_FRAMES);
     return 0;
 }
 
@@ -192,32 +246,42 @@ static void ios_audio_start_stream(void){
     if (stream_running || !playback_callback) return;
     if (!queue && create_queue()) return;
 
-    // prime ring + all AudioQueue buffers, then start
-    store_release(&ring_read, 0);
-    store_release(&ring_write, 0);
+    // every buffer starts out free
+    unsigned int i;
+    for (i = 0; i < NUM_BUFFERS; i++) free_queue[i] = aq_buffers[i];
+    free_read = 0;
+    __atomic_store_n(&free_write, NUM_BUFFERS, __ATOMIC_RELEASE);
+    __atomic_store_n(&frames_queued, 0, __ATOMIC_RELEASE);
+    held_buffer = NULL;
+    primed      = 0;
+    rebuffering = 0;
+    underruns   = 0;
     __atomic_store_n(&stream_running, 1, __ATOMIC_RELEASE);
-    fill_ring();
-    int i;
-    for (i = 0; i < NUM_AQ_BUFFERS; i++){
-        aq_output_callback(NULL, queue, aq_buffers[i]);
-        fill_ring();
-    }
-    OSStatus err = AudioQueueStart(queue, NULL);
-    if (err){
-        log_error("AudioQueueStart failed: %d", (int) err);
+
+    // prime as many buffers as there is audio for (the sink waits for ~all of them)
+    fill_free_buffers();
+    if (!primed){
+        // not even one buffer's worth: start with what there is rather than not at all
+        AudioQueueBufferRef b = held_buffer ? held_buffer : free_queue_pop();
+        if (b && enqueue(b) && b == held_buffer) held_buffer = NULL;
     }
 
-    btstack_run_loop_set_timer_handler(&fill_timer, &fill_timer_handler);
-    btstack_run_loop_set_timer(&fill_timer, FILL_TIMER_MS);
-    btstack_run_loop_add_timer(&fill_timer);
+    OSStatus err = AudioQueueStart(queue, NULL);
+    if (err) log_error("AudioQueueStart failed: %d", (int) err);
+
+    btstack_run_loop_set_timer_handler(&fallback_timer, &fallback_timer_handler);
+    btstack_run_loop_set_timer(&fallback_timer, FALLBACK_TIMER_MS);
+    btstack_run_loop_add_timer(&fallback_timer);
 }
 
 static void ios_audio_stop_stream(void){
     if (!stream_running) return;
     __atomic_store_n(&stream_running, 0, __ATOMIC_RELEASE);
-    btstack_run_loop_remove_timer(&fill_timer);
+    btstack_run_loop_remove_timer(&fallback_timer);
     // tear the queue down; start_stream builds a fresh one
     close_queue();
+    held_buffer = NULL;
+    __atomic_store_n(&frames_queued, 0, __ATOMIC_RELEASE);
 }
 
 static void ios_audio_close(void){
@@ -237,4 +301,21 @@ static const btstack_audio_sink_t btstack_audio_ios_sink = {
 
 const btstack_audio_sink_t * btstack_audio_ios_sink_get_instance(void){
     return &btstack_audio_ios_sink;
+}
+
+void btstack_audio_ios_set_available_handler(uint32_t (*handler)(void)){
+    available_handler = handler;
+}
+
+void btstack_audio_ios_kick(void){
+    fill_free_buffers();
+}
+
+uint32_t btstack_audio_ios_get_queued_frames(void){
+    int32_t q = __atomic_load_n(&frames_queued, __ATOMIC_ACQUIRE);
+    return q > 0 ? (uint32_t) q : 0;
+}
+
+uint32_t btstack_audio_ios_get_underruns(void){
+    return underruns;
 }

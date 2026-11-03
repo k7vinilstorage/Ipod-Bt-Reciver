@@ -18,12 +18,14 @@
 
 #include "btstack_config.h"
 
+#include <dlfcn.h>
 #include <errno.h>
 #include <notify.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -138,6 +140,17 @@ static void load_name(void){
         if (line[0]) strcpy(local_name, line);
     }
     fclose(f);
+}
+
+// Bluetooth I/O and SBC decoding run on this thread: keep iOS from treating it as
+// background work (that gets worse while the screen is off).
+static void raise_priority(void){
+    if (setpriority(PRIO_PROCESS, 0, -10) != 0){
+        printf("a2dpsinkd: setpriority failed: %s\n", strerror(errno));
+    }
+    typedef int (*set_qos_class_t)(unsigned int qos_class, int relative_priority);
+    set_qos_class_t set_qos = (set_qos_class_t) dlsym(RTLD_DEFAULT, "pthread_set_qos_class_self_np");  // iOS 8+
+    if (set_qos) set_qos(0x21 /* QOS_CLASS_USER_INTERACTIVE */, 0);
 }
 
 // --- shutdown ---
@@ -376,6 +389,7 @@ int main(int argc, const char * argv[]){
 
     setvbuf(stdout, NULL, _IOLBF, 0);
     setvbuf(stderr, NULL, _IOLBF, 0);
+    raise_priority();
 
     mkdir(SINK_DATA_DIR, 0755);
     if (!ignore_enabled_flag && access(SINK_ENABLED_FLAG, F_OK) != 0){
