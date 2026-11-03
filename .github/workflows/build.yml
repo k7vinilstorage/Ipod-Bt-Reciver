@@ -1,0 +1,111 @@
+name: Build
+
+# Every push / PR builds the .deb (downloadable as a workflow artifact).
+# Pushing a tag like v0.2.0 also publishes a GitHub release with the .deb attached.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to create releases
+
+env:
+  THEOS: ${{ github.workspace }}/theos
+  # Pinned so every build uses the exact toolchain the package was verified with
+  THEOS_COMMIT: 6e7b8c40e0f5f9f5b2377800dc1e42cd2560d24a
+  SDKS_COMMIT: 0222fd5413cf4b9af096f37b4621afa2688572f7
+  TOOLCHAIN_URL: https://github.com/L1ghtmann/llvm-project/releases/download/test-210562a/iOSToolchain-x86_64.tar.xz
+  TOOLCHAIN_SHA256: a72a7a577e2fbe2838b6b5e9c72034fa7d114af96f0e1d4b016f18730ce4056e
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          path: src
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends rsync
+
+      - name: Cache Theos, toolchain and SDK
+        id: theos-cache
+        uses: actions/cache@v4
+        with:
+          path: theos
+          key: theos-${{ env.THEOS_COMMIT }}-${{ env.TOOLCHAIN_SHA256 }}-${{ env.SDKS_COMMIT }}-ios10.3
+
+      - name: Set up Theos (armv7 toolchain + iOS 10.3 SDK)
+        if: steps.theos-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/theos/theos.git "$THEOS"
+          git -C "$THEOS" checkout --quiet "$THEOS_COMMIT"
+          git -C "$THEOS" submodule update --init --recursive
+
+          curl -fsSL -o /tmp/toolchain.tar.xz "$TOOLCHAIN_URL"
+          echo "$TOOLCHAIN_SHA256  /tmp/toolchain.tar.xz" | sha256sum -c -
+          mkdir -p "$THEOS/toolchain"
+          tar -xf /tmp/toolchain.tar.xz -C "$THEOS/toolchain"   # -> toolchain/linux/iphone
+
+          git clone --quiet --filter=blob:none --sparse --no-checkout https://github.com/theos/sdks.git /tmp/sdks
+          git -C /tmp/sdks sparse-checkout set iPhoneOS10.3.sdk
+          git -C /tmp/sdks checkout --quiet "$SDKS_COMMIT"
+          mkdir -p "$THEOS/sdks"
+          mv /tmp/sdks/iPhoneOS10.3.sdk "$THEOS/sdks/"
+
+      - name: Fetch BTstack
+        working-directory: src
+        run: ./get_btstack.sh
+
+      - name: Check tag matches package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        working-directory: src
+        run: |
+          version=$(sed -n 's/^Version: //p' control)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Version: $version in control"
+            exit 1
+          fi
+
+      - name: Build package
+        working-directory: src
+        run: make package FINALPACKAGE=1
+
+      - name: Verify package
+        working-directory: src
+        run: |
+          deb=$(ls packages/*.deb)
+          echo "DEB=$deb" >> "$GITHUB_ENV"
+          dpkg-deb -I "$deb"
+          dpkg-deb -c "$deb"
+          rm -rf /tmp/deb && mkdir /tmp/deb && dpkg-deb -x "$deb" /tmp/deb
+          for bin in /tmp/deb/usr/libexec/a2dpsinkd /tmp/deb/Applications/A2DPSink.app/A2DPSink; do
+            file "$bin"
+            file "$bin" | grep -q 'Mach-O armv7 executable' || { echo "::error::$bin is not an armv7 executable"; exit 1; }
+          done
+          for f in Library/LaunchDaemons/local.a2dpsinkd.plist Applications/A2DPSink.app/Default-568h@2x.png; do
+            test -f "/tmp/deb/$f" || { echo "::error::missing $f"; exit 1; }
+          done
+          sha256sum "$deb"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: src/packages/*.deb
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        working-directory: src
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "$DEB" \
+            --title "iPod BT Receiver $GITHUB_REF_NAME" \
+            --notes-file .github/release-notes.md

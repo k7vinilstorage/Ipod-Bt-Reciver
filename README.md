@@ -1,5 +1,9 @@
 # BT Receiver: A2DP sink for a jailbroken iPod touch 5
 
+[![Build](https://github.com/k7vinilstorage/ipod-bt-reciver/actions/workflows/build.yml/badge.svg)](https://github.com/k7vinilstorage/ipod-bt-reciver/actions/workflows/build.yml)
+
+**Download:** get the latest `.deb` from [Releases](https://github.com/k7vinilstorage/ipod-bt-reciver/releases/latest).
+
 Turns an iPod touch 5 (iOS 6 – 9.3.5, jailbroken) into a Bluetooth audio receiver.
 Your phone pairs with it like a speaker, and the music plays through the iPod's
 headphone jack, speaker, or dock line-out. The phone's volume slider and track info
@@ -39,6 +43,12 @@ app (mobile) ──flag file──▶ launchd ──▶ a2dpsinkd (root)
 ```
 
 ## Build
+
+Every push is built by GitHub Actions (`.github/workflows/build.yml`), using the same
+pinned Theos, toolchain and SDK. The `.deb` is available as a workflow artifact. Pushing
+a tag `vX.Y.Z` that matches `Version:` in `control` publishes a release.
+
+To build locally:
 
 You need [Theos](https://theos.dev) with a toolchain that can still build **armv7**.
 The easiest is Linux or WSL, using Theos' own toolchain. On macOS, Xcode 14 and later
