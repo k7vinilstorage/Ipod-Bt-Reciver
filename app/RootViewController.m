@@ -10,15 +10,18 @@
 #define SINK_STATUS_FILE   SINK_DATA_DIR @"/status"
 #define SINK_LAST_DEVICE   SINK_DATA_DIR @"/last_device"
 #define SINK_LINK_KEY_DB   SINK_DATA_DIR @"/pairings.tlv"
+#define SINK_SETTINGS_FILE SINK_DATA_DIR @"/settings"
 #define SINK_DEFAULT_NAME  @"iPod Receiver"
 
 enum { SectionReceiver, SectionStatus, SectionSettings, SectionCount };
 enum { StatusRowState, StatusRowDevice, StatusRowTrack, StatusRowCodec, StatusRowAddress, StatusRowCount };
-enum { SettingsRowName, SettingsRowForget, SettingsRowCount };
+enum { SettingsRowName, SettingsRowCharging, SettingsRowReconnect, SettingsRowForget, SettingsRowCount };
 enum { AlertRename = 1, AlertForget = 2 };
 
 @interface RootViewController () <UIAlertViewDelegate>
 @property (nonatomic, strong) UISwitch * receiverSwitch;
+@property (nonatomic, strong) UISwitch * chargingSwitch;
+@property (nonatomic, strong) UISwitch * reconnectSwitch;
 @property (nonatomic, strong) NSDictionary * status;
 @property (nonatomic, strong) NSTimer * timer;
 @property (nonatomic, strong) NSDate * enabledAt;
@@ -35,6 +38,10 @@ enum { AlertRename = 1, AlertForget = 2 };
     self.title = @"Bluetooth Receiver";
     self.receiverSwitch = [[UISwitch alloc] init];
     [self.receiverSwitch addTarget:self action:@selector(switchChanged:) forControlEvents:UIControlEventValueChanged];
+    self.chargingSwitch = [[UISwitch alloc] init];
+    [self.chargingSwitch addTarget:self action:@selector(settingSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+    self.reconnectSwitch = [[UISwitch alloc] init];
+    [self.reconnectSwitch addTarget:self action:@selector(settingSwitchChanged:) forControlEvents:UIControlEventValueChanged];
     [[NSFileManager defaultManager] createDirectoryAtPath:SINK_DATA_DIR withIntermediateDirectories:YES attributes:nil error:NULL];
     [self refresh];
 }
@@ -81,7 +88,13 @@ enum { AlertRename = 1, AlertForget = 2 };
     if (![self enabled]) return alive ? @"Stopping…" : @"Off";
     if (!alive) {
         if (self.enabledAt && [[NSDate date] timeIntervalSinceDate:self.enabledAt] < 15) return @"Starting…";
+        // between sessions in "only while charging" mode launchd restarts the daemon
+        if ([self onlyWhenCharging]) return @"Waiting for charger";
         return @"Not running";
+    }
+    if ([state isEqualToString:@"waiting_power"]) return @"Waiting for charger";
+    if ([state isEqualToString:@"ready"] && [self.status[@"reconnecting"] length]) {
+        return [NSString stringWithFormat:@"Reconnecting to %@…", self.status[@"reconnecting"]];
     }
     if ([state isEqualToString:@"starting"])  return @"Starting…";
     if ([state isEqualToString:@"ready"])     return @"Waiting for a phone";
@@ -101,11 +114,39 @@ enum { AlertRename = 1, AlertForget = 2 };
     return name.length ? name : SINK_DEFAULT_NAME;
 }
 
+// settings file: key=value lines, read by the daemon every second
+- (NSDictionary *)readSettings {
+    NSString * text = [NSString stringWithContentsOfFile:SINK_SETTINGS_FILE encoding:NSUTF8StringEncoding error:NULL];
+    NSMutableDictionary * result = [NSMutableDictionary dictionaryWithDictionary:@{ @"only_when_charging": @"0", @"auto_reconnect": @"1" }];
+    for (NSString * line in [text componentsSeparatedByString:@"\n"]) {
+        NSRange eq = [line rangeOfString:@"="];
+        if (eq.location == NSNotFound) continue;
+        result[[line substringToIndex:eq.location]] = [line substringFromIndex:eq.location + 1];
+    }
+    return result;
+}
+
+- (BOOL)onlyWhenCharging {
+    return [[self readSettings][@"only_when_charging"] intValue] != 0;
+}
+
+- (BOOL)autoReconnect {
+    return [[self readSettings][@"auto_reconnect"] intValue] != 0;
+}
+
+- (void)writeSettings {
+    NSString * text = [NSString stringWithFormat:@"only_when_charging=%d\nauto_reconnect=%d\n",
+                       self.chargingSwitch.on ? 1 : 0, self.reconnectSwitch.on ? 1 : 0];
+    [text writeToFile:SINK_SETTINGS_FILE atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+}
+
 - (void)refresh {
     self.status = [self readStatus];
     if (!self.receiverSwitch.isTracking) {
         [self.receiverSwitch setOn:[self enabled] animated:YES];
     }
+    if (!self.chargingSwitch.isTracking)  [self.chargingSwitch setOn:[self onlyWhenCharging] animated:NO];
+    if (!self.reconnectSwitch.isTracking) [self.reconnectSwitch setOn:[self autoReconnect] animated:NO];
     [self.tableView reloadData];
 }
 
@@ -120,6 +161,11 @@ enum { AlertRename = 1, AlertForget = 2 };
         self.enabledAt = nil;
         [fm removeItemAtPath:SINK_ENABLED_FLAG error:NULL];
     }
+    [self refresh];
+}
+
+- (void)settingSwitchChanged:(UISwitch *)sender {
+    [self writeSettings];
     [self refresh];
 }
 
@@ -191,6 +237,9 @@ enum { AlertRename = 1, AlertForget = 2 };
         return [NSString stringWithFormat:@"Pair your phone with \"%@\". While the receiver is on, iOS Bluetooth is off and the iPod stays awake.",
                 [self configuredName]];
     }
+    if (section == SectionSettings) {
+        return @"Only While Charging: the receiver turns on when the iPod is connected to power (charger, computer or dock) and hands Bluetooth back to iOS 5 seconds after it is unplugged.\n\nReconnect Automatically: connects back to the last phone when the receiver starts and after the connection was lost.";
+    }
     return nil;
 }
 
@@ -245,6 +294,14 @@ enum { AlertRename = 1, AlertForget = 2 };
             cell.textLabel.text = @"Name";
             cell.detailTextLabel.text = [self configuredName];
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        } else if (indexPath.row == SettingsRowCharging) {
+            cell.textLabel.text = @"Only While Charging";
+            cell.accessoryView = self.chargingSwitch;
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        } else if (indexPath.row == SettingsRowReconnect) {
+            cell.textLabel.text = @"Reconnect Automatically";
+            cell.accessoryView = self.reconnectSwitch;
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
         } else {
             cell.textLabel.text = @"Forget Paired Devices";
             cell.textLabel.textColor = [UIColor redColor];
@@ -257,7 +314,7 @@ enum { AlertRename = 1, AlertForget = 2 };
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     if (indexPath.section != SectionSettings) return;
     if (indexPath.row == SettingsRowName) [self renameTapped];
-    else [self forgetTapped];
+    else if (indexPath.row == SettingsRowForget) [self forgetTapped];
 }
 
 @end

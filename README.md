@@ -68,7 +68,7 @@ Then, inside this folder:
 make package FINALPACKAGE=1
 ```
 
-This produces `packages/local.a2dpsink_0.1.1_iphoneos-arm.deb`.
+This produces `packages/local.a2dpsink_0.2.0_iphoneos-arm.deb`.
 
 ## Install
 
@@ -85,11 +85,23 @@ Or copy the `.deb` over and run `dpkg -i` on it as root, then `uicache`.
 1. Open **BT Receiver** and switch **Receiver** on. The status changes from
    *Starting…* to *Waiting for a phone* after a few seconds.
 2. On your phone, pair with **iPod Receiver**. No PIN is needed; old phones get `0000`.
-3. Play music. Next time, the iPod tries to reconnect to the last phone by itself.
+3. Play music.
 
 While the receiver is on, the iPod's own Bluetooth (Settings) is off, and the iPod is
 kept awake. The screen can turn off, but the device won't sleep, so keep it plugged in.
-The **Name** and **Forget Paired Devices** options are in the app.
+
+### Options in the app
+
+- **Only While Charging:** the receiver only turns on while the iPod has external power
+  (charger, computer or dock). The rest of the time, the iPod's own Bluetooth works
+  normally and the iPod can sleep. When power is connected, the receiver turns on within
+  a second or two. Five seconds after the cable is removed, it hands Bluetooth back to iOS.
+- **Reconnect Automatically** (on by default): when the receiver starts and after the
+  connection was lost (out of range, Bluetooth toggled on the phone), the iPod connects
+  back to the last phone. It retries every 10 s for 2 minutes, then every 60 s. It doesn't
+  reconnect if you disconnected from the phone on purpose; connect from the phone and it
+  starts working again. The app shows *Reconnecting to …* while it tries.
+- **Name** and **Forget Paired Devices**.
 
 ## If it doesn't work
 

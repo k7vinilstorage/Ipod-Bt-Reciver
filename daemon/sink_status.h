@@ -9,6 +9,7 @@
 #define SINK_STATUS_FILE   SINK_DATA_DIR "/status"       // written by daemon, key=value lines
 #define SINK_LAST_DEVICE   SINK_DATA_DIR "/last_device"  // BD_ADDR of last connected phone
 #define SINK_LINK_KEY_DB   SINK_DATA_DIR "/pairings.tlv"
+#define SINK_SETTINGS_FILE SINK_DATA_DIR "/settings"     // app writes: only_when_charging=0/1, auto_reconnect=0/1
 
 #define SINK_DEFAULT_NAME  "iPod Receiver"
 
@@ -19,6 +20,7 @@ typedef enum {
     SINK_STATE_PLAYING,
     SINK_STATE_STOPPING,
     SINK_STATE_ERROR,
+    SINK_STATE_WAITING_POWER, // "only while charging" mode, no external power
 } sink_state_t;
 
 void sink_status_set_state(sink_state_t state);
@@ -28,6 +30,8 @@ void sink_status_set_local_addr(const char * addr);
 void sink_status_set_remote(const char * addr, const char * name);
 void sink_status_set_codec(const char * description);
 void sink_status_set_track(const char * title, const char * artist);
+// device we are trying to reconnect to, NULL/"" when not reconnecting
+void sink_status_set_reconnecting(const char * device);
 
 // write the status file now (otherwise written by the setters)
 void sink_status_flush(void);

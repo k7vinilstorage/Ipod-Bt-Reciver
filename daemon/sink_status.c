@@ -6,7 +6,7 @@
 #include <unistd.h>
 
 static const char * state_names[] = {
-    "starting", "ready", "connected", "playing", "stopping", "error",
+    "starting", "ready", "connected", "playing", "stopping", "error", "waiting_power",
 };
 
 static sink_state_t state = SINK_STATE_STARTING;
@@ -18,6 +18,7 @@ static char remote_name[64];
 static char codec[64];
 static char title[128];
 static char artist[128];
+static char reconnecting[64];
 
 static void copy_clean(char * dst, size_t size, const char * src){
     size_t i = 0;
@@ -43,6 +44,7 @@ void sink_status_flush(void){
     fprintf(f, "codec=%s\n", codec);
     fprintf(f, "title=%s\n", title);
     fprintf(f, "artist=%s\n", artist);
+    fprintf(f, "reconnecting=%s\n", reconnecting);
     fprintf(f, "error=%s\n", error_message);
     fclose(f);
     chmod(tmp_path, 0644);
@@ -52,9 +54,10 @@ void sink_status_flush(void){
 void sink_status_set_state(sink_state_t new_state){
     state = new_state;
     if (state != SINK_STATE_ERROR) error_message[0] = 0;
-    if (state == SINK_STATE_READY || state == SINK_STATE_STARTING || state == SINK_STATE_STOPPING){
+    if (state != SINK_STATE_CONNECTED && state != SINK_STATE_PLAYING){
         remote_addr[0] = remote_name[0] = codec[0] = title[0] = artist[0] = 0;
     }
+    if (state != SINK_STATE_READY) reconnecting[0] = 0;
     sink_status_flush();
 }
 
@@ -88,5 +91,10 @@ void sink_status_set_codec(const char * description){
 void sink_status_set_track(const char * new_title, const char * new_artist){
     if (new_title)  copy_clean(title, sizeof(title), new_title);
     if (new_artist) copy_clean(artist, sizeof(artist), new_artist);
+    sink_status_flush();
+}
+
+void sink_status_set_reconnecting(const char * device){
+    copy_clean(reconnecting, sizeof(reconnecting), device);
     sink_status_flush();
 }

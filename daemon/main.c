@@ -3,8 +3,13 @@
  * into a Bluetooth A2DP receiver.
  *
  * Started/stopped by launchd: the job runs while SINK_ENABLED_FLAG exists (the app
- * creates/removes it). On start it takes the Bluetooth controller away from iOS, on
- * exit it gives it back.
+ * creates/removes it). Bluetooth is taken away from iOS when the receiver becomes active
+ * and given back on exit.
+ *
+ * "Only while charging" (settings file): the daemon waits without touching Bluetooth
+ * until external power (charger, computer, dock) is connected. When power goes away for
+ * more than a few seconds it exits; launchd starts it again and it goes back to waiting.
+ * One process = at most one Bluetooth session, so every session starts from a clean state.
  *
  * Usage: a2dpsinkd [-f] [-d]
  *   -f  run even if the enabled flag is missing (manual testing over SSH)
@@ -14,6 +19,7 @@
 #include "btstack_config.h"
 
 #include <errno.h>
+#include <notify.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,17 +42,24 @@
 #include "sink.h"
 #include "sink_status.h"
 
-#define HCI_DUMP_PATH        "/tmp/a2dpsink.pklg"
-#define POLL_INTERVAL_MS     1000
-#define STARTUP_TIMEOUT_MS   20000
-#define SHUTDOWN_TIMEOUT_MS  4000
+#define HCI_DUMP_PATH          "/tmp/a2dpsink.pklg"
+#define POLL_INTERVAL_MS       1000
+#define IDLE_POLL_INTERVAL_MS  5000     // fallback; power changes also arrive via notify
+#define POWER_LOSS_GRACE_MS    5000     // ignore short cable wiggles
+#define STARTUP_TIMEOUT_MS     20000
+#define SHUTDOWN_TIMEOUT_MS    4000
 
-// --- IOKit power assertion: keep the iPod from sleeping while the receiver is on ---
+// notify(3) name posted by powerd when the power source changes (kIOPSNotifyPowerSource)
+#define POWER_SOURCE_NOTIFICATION "com.apple.system.powersources.source"
+
+// --- IOKit (no headers in the SDK) ---
 typedef uint32_t IOPMAssertionID;
 typedef uint32_t IOPMAssertionLevel;
 int IOPMAssertionCreateWithName(CFStringRef type, IOPMAssertionLevel level, CFStringRef name, IOPMAssertionID * id);
 int IOPMAssertionRelease(IOPMAssertionID id);
 #define kIOPMAssertionLevelOn 255
+CFTypeRef   IOPSCopyPowerSourcesInfo(void);
+CFStringRef IOPSGetProvidingPowerSourceType(CFTypeRef snapshot);
 
 static IOPMAssertionID power_assertion;
 
@@ -65,17 +78,71 @@ static btstack_timer_source_t poll_timer;
 static btstack_timer_source_t startup_timer;
 static btstack_timer_source_t shutdown_timer;
 static btstack_data_source_t  signal_data_source;
+static btstack_data_source_t  power_notify_data_source;
 static int signal_pipe[2] = { -1, -1 };
 static int ignore_enabled_flag;
 static int shutting_down;
+static int bluetooth_started;
 static int hci_working;
+static uint32_t power_lost_since_ms;
 static char local_name[64] = SINK_DEFAULT_NAME;
 
+// settings (written by the app)
+static int setting_only_when_charging;
+static int setting_auto_reconnect = 1;
+
+// --- helpers ---
+
+static void load_settings(void){
+    setting_only_when_charging = 0;
+    setting_auto_reconnect = 1;
+    FILE * f = fopen(SINK_SETTINGS_FILE, "r");
+    if (!f) return;
+    char line[64];
+    int value;
+    while (fgets(line, sizeof(line), f)){
+        if (sscanf(line, "only_when_charging=%d", &value) == 1) setting_only_when_charging = value != 0;
+        if (sscanf(line, "auto_reconnect=%d", &value) == 1)     setting_auto_reconnect = value != 0;
+    }
+    fclose(f);
+}
+
+static int on_external_power(void){
+    CFTypeRef info = IOPSCopyPowerSourcesInfo();
+    if (!info){
+        log_error("a2dpsinkd: cannot read power source, assuming external power");
+        return 1;
+    }
+    CFStringRef type = IOPSGetProvidingPowerSourceType(info);
+    int ac = type && CFStringCompare(type, CFSTR("AC Power"), 0) == kCFCompareEqualTo;
+    CFRelease(info);
+    return ac;
+}
+
+static int receiver_wanted(void){
+    return !setting_only_when_charging || on_external_power();
+}
+
+static void load_name(void){
+    FILE * f = fopen(SINK_NAME_FILE, "r");
+    if (!f) return;
+    char line[sizeof(local_name)];
+    if (fgets(line, sizeof(line), f)){
+        line[strcspn(line, "\r\n")] = 0;
+        if (line[0]) strcpy(local_name, line);
+    }
+    fclose(f);
+}
+
+// --- shutdown ---
+
 static void finish(int exit_code){
-    sink_shutdown_audio();
-    btstack_control_ipod_restore_system_bluetooth();
+    if (bluetooth_started){
+        sink_shutdown_audio();
+        btstack_control_ipod_restore_system_bluetooth();
+        btstack_tlv_posix_deinit(&tlv_context);
+    }
     if (power_assertion) IOPMAssertionRelease(power_assertion);
-    btstack_tlv_posix_deinit(&tlv_context);
     log_info("a2dpsinkd: exit %d", exit_code);
     exit(exit_code);
 }
@@ -91,7 +158,6 @@ static void fail(const char * message){
 static void shutdown_timeout_handler(btstack_timer_source_t * ts){
     UNUSED(ts);
     log_error("a2dpsinkd: HCI did not power off in time, forcing exit");
-    sink_status_set_state(SINK_STATE_STOPPING);
     finish(0);
 }
 
@@ -103,62 +169,21 @@ static void begin_shutdown(void){
     btstack_run_loop_remove_timer(&poll_timer);
     btstack_run_loop_remove_timer(&startup_timer);
 
+    if (!hci_working) finish(0);
+
     btstack_run_loop_set_timer_handler(&shutdown_timer, &shutdown_timeout_handler);
     btstack_run_loop_set_timer(&shutdown_timer, SHUTDOWN_TIMEOUT_MS);
     btstack_run_loop_add_timer(&shutdown_timer);
 
-    if (hci_working){
-        sink_disconnect();
-        hci_power_control(HCI_POWER_OFF);   // -> HCI_STATE_OFF -> finish()
-    } else {
-        finish(0);
-    }
+    sink_disconnect();
+    hci_power_control(HCI_POWER_OFF);   // -> HCI_STATE_OFF -> finish()
 }
+
+// --- Bluetooth session ---
 
 static void startup_timeout_handler(btstack_timer_source_t * ts){
     UNUSED(ts);
     if (!hci_working) fail("Bluetooth controller did not respond");
-}
-
-static void poll_timer_handler(btstack_timer_source_t * ts){
-    if (!ignore_enabled_flag && access(SINK_ENABLED_FLAG, F_OK) != 0){
-        begin_shutdown();
-        return;
-    }
-    if (hci_working && access(SINK_FORGET_FLAG, F_OK) == 0){
-        log_info("a2dpsinkd: forgetting all paired devices");
-        unlink(SINK_FORGET_FLAG);
-        unlink(SINK_LAST_DEVICE);
-        gap_delete_all_link_keys();
-    }
-    btstack_run_loop_set_timer(ts, POLL_INTERVAL_MS);
-    btstack_run_loop_add_timer(ts);
-}
-
-static void signal_handler(int sig){
-    char c = (char) sig;
-    if (write(signal_pipe[1], &c, 1) < 0) { /* nothing we can do */ }
-}
-
-static void signal_data_source_handler(btstack_data_source_t * ds, btstack_data_source_callback_type_t type){
-    UNUSED(type);
-    char c;
-    if (read(ds->source.fd, &c, 1) == 1){
-        log_info("a2dpsinkd: signal %d", c);
-        begin_shutdown();
-    }
-}
-
-static void setup_signals(void){
-    if (pipe(signal_pipe) != 0) return;
-    btstack_run_loop_set_data_source_fd(&signal_data_source, signal_pipe[0]);
-    btstack_run_loop_set_data_source_handler(&signal_data_source, &signal_data_source_handler);
-    btstack_run_loop_enable_data_source_callbacks(&signal_data_source, DATA_SOURCE_CALLBACK_READ);
-    btstack_run_loop_add_data_source(&signal_data_source);
-    signal(SIGTERM, signal_handler);
-    signal(SIGINT,  signal_handler);
-    signal(SIGHUP,  signal_handler);
-    signal(SIGPIPE, SIG_IGN);
 }
 
 static void hci_event_handler(uint8_t packet_type, uint16_t channel, uint8_t * packet, uint16_t size){
@@ -194,15 +219,136 @@ static void hci_event_handler(uint8_t packet_type, uint16_t channel, uint8_t * p
     }
 }
 
-static void load_name(void){
-    FILE * f = fopen(SINK_NAME_FILE, "r");
-    if (!f) return;
-    char line[sizeof(local_name)];
-    if (fgets(line, sizeof(line), f)){
-        line[strcspn(line, "\r\n")] = 0;
-        if (line[0]) strcpy(local_name, line);
+static void start_bluetooth(void){
+    if (bluetooth_started) return;
+    bluetooth_started = 1;
+    printf("a2dpsinkd: starting Bluetooth on %s%s\n", btstack_control_ipod_machine(),
+           setting_only_when_charging ? " (external power connected)" : "");
+
+    sink_status_set_state(SINK_STATE_STARTING);
+
+    // keep the iPod awake while the receiver is active
+    IOPMAssertionCreateWithName(CFSTR("PreventUserIdleSystemSleep"), kIOPMAssertionLevelOn,
+                                CFSTR("A2DP receiver"), &power_assertion);
+
+    // pairings
+    const btstack_tlv_t * tlv_impl = btstack_tlv_posix_init_instance(&tlv_context, SINK_LINK_KEY_DB);
+    btstack_tlv_set_instance(tlv_impl, &tlv_context);
+
+    hci_init(hci_transport_h4_ipod_instance(), &transport_config);
+    hci_set_control(btstack_control_ipod_instance());
+    hci_set_link_key_db(btstack_link_key_db_tlv_get_instance(tlv_impl, &tlv_context));
+    hci_transport_h4_ipod_set_enforce_wake_device("/dev/btwake");
+
+    hci_event_callback_registration.callback = &hci_event_handler;
+    hci_add_event_handler(&hci_event_callback_registration);
+
+    sink_setup(local_name, btstack_audio_ios_sink_get_instance());
+    sink_set_auto_reconnect(setting_auto_reconnect);
+
+    btstack_run_loop_set_timer_handler(&startup_timer, &startup_timeout_handler);
+    btstack_run_loop_set_timer(&startup_timer, STARTUP_TIMEOUT_MS);
+    btstack_run_loop_add_timer(&startup_timer);
+
+    hci_power_control(HCI_POWER_ON);   // blocks while BlueTool boots the chip
+}
+
+// --- periodic / event driven checks ---
+
+static void evaluate(void){
+    if (shutting_down) return;
+
+    if (!ignore_enabled_flag && access(SINK_ENABLED_FLAG, F_OK) != 0){
+        begin_shutdown();
+        return;
     }
-    fclose(f);
+
+    load_settings();
+    int wanted = receiver_wanted();
+
+    if (!bluetooth_started){
+        if (wanted) start_bluetooth();
+        return;
+    }
+
+    if (!wanted){
+        uint32_t now = btstack_run_loop_get_time_ms();
+        if (power_lost_since_ms == 0){
+            power_lost_since_ms = now ? now : 1;
+            log_info("a2dpsinkd: external power gone");
+        } else if (now - power_lost_since_ms >= POWER_LOSS_GRACE_MS){
+            log_info("a2dpsinkd: still no external power, handing Bluetooth back to iOS");
+            begin_shutdown();   // launchd restarts us -> waiting for power
+            return;
+        }
+    } else {
+        power_lost_since_ms = 0;
+    }
+
+    sink_set_auto_reconnect(setting_auto_reconnect);
+
+    if (hci_working && access(SINK_FORGET_FLAG, F_OK) == 0){
+        log_info("a2dpsinkd: forgetting all paired devices");
+        unlink(SINK_FORGET_FLAG);
+        unlink(SINK_LAST_DEVICE);
+        sink_forget_last_device();
+        gap_delete_all_link_keys();
+    }
+}
+
+static void poll_timer_handler(btstack_timer_source_t * ts){
+    evaluate();
+    if (shutting_down) return;
+    btstack_run_loop_set_timer(ts, bluetooth_started ? POLL_INTERVAL_MS : IDLE_POLL_INTERVAL_MS);
+    btstack_run_loop_add_timer(ts);
+}
+
+static void power_notify_handler(btstack_data_source_t * ds, btstack_data_source_callback_type_t type){
+    UNUSED(type);
+    int token;
+    if (read(ds->source.fd, &token, sizeof(token)) <= 0) return;
+    log_info("a2dpsinkd: power source changed (%s)", on_external_power() ? "external power" : "battery");
+    evaluate();
+}
+
+static void setup_power_notifications(void){
+    int fd = -1, token = 0;
+    if (notify_register_file_descriptor(POWER_SOURCE_NOTIFICATION, &fd, 0, &token) != NOTIFY_STATUS_OK){
+        log_error("a2dpsinkd: notify_register_file_descriptor failed, polling only");
+        return;
+    }
+    btstack_run_loop_set_data_source_fd(&power_notify_data_source, fd);
+    btstack_run_loop_set_data_source_handler(&power_notify_data_source, &power_notify_handler);
+    btstack_run_loop_enable_data_source_callbacks(&power_notify_data_source, DATA_SOURCE_CALLBACK_READ);
+    btstack_run_loop_add_data_source(&power_notify_data_source);
+}
+
+// --- signals ---
+
+static void signal_handler(int sig){
+    char c = (char) sig;
+    if (write(signal_pipe[1], &c, 1) < 0) { /* nothing we can do */ }
+}
+
+static void signal_data_source_handler(btstack_data_source_t * ds, btstack_data_source_callback_type_t type){
+    UNUSED(type);
+    char c;
+    if (read(ds->source.fd, &c, 1) == 1){
+        log_info("a2dpsinkd: signal %d", c);
+        begin_shutdown();
+    }
+}
+
+static void setup_signals(void){
+    if (pipe(signal_pipe) != 0) return;
+    btstack_run_loop_set_data_source_fd(&signal_data_source, signal_pipe[0]);
+    btstack_run_loop_set_data_source_handler(&signal_data_source, &signal_data_source_handler);
+    btstack_run_loop_enable_data_source_callbacks(&signal_data_source, DATA_SOURCE_CALLBACK_READ);
+    btstack_run_loop_add_data_source(&signal_data_source);
+    signal(SIGTERM, signal_handler);
+    signal(SIGINT,  signal_handler);
+    signal(SIGHUP,  signal_handler);
+    signal(SIGPIPE, SIG_IGN);
 }
 
 int main(int argc, const char * argv[]){
@@ -227,6 +373,7 @@ int main(int argc, const char * argv[]){
     }
 
     load_name();
+    load_settings();
     sink_status_set_name(local_name);
     sink_status_set_state(SINK_STATE_STARTING);
 
@@ -252,35 +399,20 @@ int main(int argc, const char * argv[]){
         return 1;
     }
 
-    IOPMAssertionCreateWithName(CFSTR("PreventUserIdleSystemSleep"), kIOPMAssertionLevelOn,
-                                CFSTR("A2DP receiver"), &power_assertion);
-
     setup_signals();
-
-    // pairings
-    const btstack_tlv_t * tlv_impl = btstack_tlv_posix_init_instance(&tlv_context, SINK_LINK_KEY_DB);
-    btstack_tlv_set_instance(tlv_impl, &tlv_context);
-
-    hci_init(hci_transport_h4_ipod_instance(), &transport_config);
-    hci_set_control(btstack_control_ipod_instance());
-    hci_set_link_key_db(btstack_link_key_db_tlv_get_instance(tlv_impl, &tlv_context));
-    hci_transport_h4_ipod_set_enforce_wake_device("/dev/btwake");
-
-    hci_event_callback_registration.callback = &hci_event_handler;
-    hci_add_event_handler(&hci_event_callback_registration);
-
-    sink_setup(local_name, btstack_audio_ios_sink_get_instance());
+    setup_power_notifications();
 
     btstack_run_loop_set_timer_handler(&poll_timer, &poll_timer_handler);
-    btstack_run_loop_set_timer(&poll_timer, POLL_INTERVAL_MS);
+
+    if (receiver_wanted()){
+        start_bluetooth();
+        btstack_run_loop_set_timer(&poll_timer, POLL_INTERVAL_MS);
+    } else {
+        printf("a2dpsinkd: 'only while charging' is on and there is no external power, waiting\n");
+        sink_status_set_state(SINK_STATE_WAITING_POWER);
+        btstack_run_loop_set_timer(&poll_timer, IDLE_POLL_INTERVAL_MS);
+    }
     btstack_run_loop_add_timer(&poll_timer);
-
-    btstack_run_loop_set_timer_handler(&startup_timer, &startup_timeout_handler);
-    btstack_run_loop_set_timer(&startup_timer, STARTUP_TIMEOUT_MS);
-    btstack_run_loop_add_timer(&startup_timer);
-
-    printf("a2dpsinkd: starting on %s\n", btstack_control_ipod_machine());
-    hci_power_control(HCI_POWER_ON);
 
     btstack_run_loop_execute();
     return 0;

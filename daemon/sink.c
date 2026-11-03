@@ -96,24 +96,116 @@ static struct {
 
 static const btstack_audio_sink_t * audio_sink;
 
-// --- persistence of last device, for reconnect on start ---
+// --- auto reconnect ---
+//
+// Reconnect to the last phone when the receiver starts and after the link was lost
+// (out of range, phone Bluetooth toggled, ...): every 10 s for 2 minutes, then every
+// 60 s until it comes back. Not after the user disconnected on the phone on purpose.
 
-static void save_last_device(const bd_addr_t addr){
+#define RECONNECT_FIRST_DELAY_MS     1000
+#define RECONNECT_AFTER_LOSS_MS      3000
+#define RECONNECT_FAST_INTERVAL_MS   10000
+#define RECONNECT_FAST_ATTEMPTS      12
+#define RECONNECT_SLOW_INTERVAL_MS   60000
+#define CONNECT_ATTEMPT_TIMEOUT_MS   30000
+#define AVRCP_CONNECT_DELAY_MS       2000
+
+static int       auto_reconnect = 1;
+static int       reconnect_blocked;          // user disconnected on the phone
+static int       reconnect_attempts;
+static int       connect_attempt_pending;
+static uint32_t  connect_attempt_started_ms;
+static btstack_timer_source_t reconnect_timer;
+static btstack_timer_source_t avrcp_connect_timer;
+static hci_con_handle_t a2dp_con_handle = HCI_CON_HANDLE_INVALID;
+
+static int       have_last_device;
+static bd_addr_t last_device_addr;
+static char      last_device_name[64];
+
+static void save_last_device(void){
     FILE * f = fopen(SINK_LAST_DEVICE, "w");
     if (!f) return;
-    fprintf(f, "%s\n", bd_addr_to_str(addr));
+    fprintf(f, "%s\n%s\n", bd_addr_to_str(last_device_addr), last_device_name);
     fclose(f);
 }
 
-static int load_last_device(bd_addr_t addr){
-    char line[32];
+static void load_last_device(void){
+    char line[80];
+    have_last_device = 0;
+    last_device_name[0] = 0;
     FILE * f = fopen(SINK_LAST_DEVICE, "r");
-    if (!f) return 0;
-    int ok = fgets(line, sizeof(line), f) != NULL;
+    if (!f) return;
+    if (fgets(line, sizeof(line), f)){
+        line[strcspn(line, "\r\n")] = 0;
+        have_last_device = sscanf_bd_addr(line, last_device_addr);
+    }
+    if (fgets(line, sizeof(line), f)){
+        line[strcspn(line, "\r\n")] = 0;
+        btstack_strcpy(last_device_name, sizeof(last_device_name), line);
+    }
     fclose(f);
-    if (!ok) return 0;
-    line[strcspn(line, "\r\n")] = 0;
-    return sscanf_bd_addr(line, addr);
+}
+
+static void remember_device(const bd_addr_t addr, const char * name){
+    if (!have_last_device || bd_addr_cmp(addr, last_device_addr) != 0){
+        last_device_name[0] = 0;        // different phone: forget old name
+    }
+    memcpy(last_device_addr, addr, 6);
+    have_last_device = 1;
+    if (name && name[0]) btstack_strcpy(last_device_name, sizeof(last_device_name), name);
+    save_last_device();
+}
+
+static int reconnect_possible(void){
+    return auto_reconnect && !reconnect_blocked && have_last_device && !a2dp_connection.connected;
+}
+
+static void reconnect_timer_handler(btstack_timer_source_t * ts);
+
+static void schedule_reconnect(uint32_t delay_ms){
+    btstack_run_loop_remove_timer(&reconnect_timer);
+    if (!reconnect_possible()){
+        sink_status_set_reconnecting(NULL);
+        return;
+    }
+    btstack_run_loop_set_timer_handler(&reconnect_timer, &reconnect_timer_handler);
+    btstack_run_loop_set_timer(&reconnect_timer, delay_ms);
+    btstack_run_loop_add_timer(&reconnect_timer);
+}
+
+static void reconnect_timer_handler(btstack_timer_source_t * ts){
+    UNUSED(ts);
+    if (!reconnect_possible()){
+        sink_status_set_reconnecting(NULL);
+        return;
+    }
+    uint32_t now = btstack_run_loop_get_time_ms();
+    if (connect_attempt_pending && (now - connect_attempt_started_ms) > CONNECT_ATTEMPT_TIMEOUT_MS){
+        log_info("reconnect: attempt timed out");
+        connect_attempt_pending = 0;
+    }
+    if (!connect_attempt_pending){
+        uint16_t cid;
+        uint8_t status = a2dp_sink_establish_stream(last_device_addr, &cid);
+        reconnect_attempts++;
+        log_info("reconnect: attempt %d to %s -> status 0x%02x", reconnect_attempts, bd_addr_to_str(last_device_addr), status);
+        if (status == ERROR_CODE_SUCCESS){
+            connect_attempt_pending = 1;
+            connect_attempt_started_ms = now;
+        }
+        sink_status_set_reconnecting(last_device_name[0] ? last_device_name : bd_addr_to_str(last_device_addr));
+    }
+    schedule_reconnect(reconnect_attempts < RECONNECT_FAST_ATTEMPTS ? RECONNECT_FAST_INTERVAL_MS : RECONNECT_SLOW_INTERVAL_MS);
+}
+
+// if the phone didn't open AVRCP itself (typical when we initiated), do it for volume / track info
+static void avrcp_connect_timer_handler(btstack_timer_source_t * ts){
+    UNUSED(ts);
+    if (!a2dp_connection.connected || avrcp_connection.avrcp_cid) return;
+    uint16_t cid;
+    uint8_t status = avrcp_connect(a2dp_connection.addr, &cid);
+    log_info("AVRCP: connecting to %s -> status 0x%02x", bd_addr_to_str(a2dp_connection.addr), status);
 }
 
 // --- audio pipeline ---
@@ -300,9 +392,26 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t * 
             if (hci_event_remote_name_request_complete_get_status(packet) != ERROR_CODE_SUCCESS) break;
             hci_event_remote_name_request_complete_get_bd_addr(packet, address);
             if (a2dp_connection.connected && bd_addr_cmp(address, a2dp_connection.addr) == 0){
-                sink_status_set_remote(NULL, hci_event_remote_name_request_complete_get_remote_name(packet));
+                const char * name = hci_event_remote_name_request_complete_get_remote_name(packet);
+                sink_status_set_remote(NULL, name);
+                remember_device(address, name);
             }
             break;
+        case HCI_EVENT_DISCONNECTION_COMPLETE: {
+            if (hci_event_disconnection_complete_get_connection_handle(packet) != a2dp_con_handle) break;
+            a2dp_con_handle = HCI_CON_HANDLE_INVALID;
+            uint8_t reason = hci_event_disconnection_complete_get_reason(packet);
+            if (reason == ERROR_CODE_REMOTE_USER_TERMINATED_CONNECTION || reason == ERROR_CODE_CONNECTION_TERMINATED_BY_LOCAL_HOST){
+                // disconnected on purpose (phone UI, or we are shutting down): don't chase the phone
+                log_info("reconnect: link closed on purpose (reason 0x%02x), not reconnecting", reason);
+                reconnect_blocked = 1;
+            } else {
+                log_info("reconnect: link lost (reason 0x%02x)", reason);
+                reconnect_attempts = 0;
+                schedule_reconnect(RECONNECT_AFTER_LOSS_MS);
+            }
+            break;
+        }
         default:
             break;
     }
@@ -319,16 +428,22 @@ static void a2dp_sink_packet_handler(uint8_t packet_type, uint16_t channel, uint
 
     switch (packet[2]){
         case A2DP_SUBEVENT_SIGNALING_CONNECTION_ESTABLISHED:
+            connect_attempt_pending = 0;
             if (a2dp_subevent_signaling_connection_established_get_status(packet) != ERROR_CODE_SUCCESS){
-                log_info("A2DP connection failed");
+                log_info("A2DP connection failed, status 0x%02x", a2dp_subevent_signaling_connection_established_get_status(packet));
                 break;
             }
             a2dp_subevent_signaling_connection_established_get_bd_addr(packet, address);
             memcpy(a2dp_connection.addr, address, 6);
             a2dp_connection.a2dp_cid = a2dp_subevent_signaling_connection_established_get_a2dp_cid(packet);
+            a2dp_con_handle = a2dp_subevent_signaling_connection_established_get_con_handle(packet);
             a2dp_connection.connected = 1;
             log_info("A2DP connected to %s", bd_addr_to_str(address));
-            save_last_device(address);
+            // connected (by us or by the phone): stop reconnecting, allow it again later
+            btstack_run_loop_remove_timer(&reconnect_timer);
+            reconnect_blocked = 0;
+            reconnect_attempts = 0;
+            remember_device(address, NULL);
             sink_status_set_state(SINK_STATE_CONNECTED);
             sink_status_set_remote(bd_addr_to_str(address), "");
             gap_remote_name_request(address, 0x01, 0);
@@ -359,6 +474,10 @@ static void a2dp_sink_packet_handler(uint8_t packet_type, uint16_t channel, uint
         case A2DP_SUBEVENT_STREAM_ESTABLISHED:
             if (a2dp_subevent_stream_established_get_status(packet) != ERROR_CODE_SUCCESS) break;
             a2dp_connection.a2dp_cid = a2dp_subevent_stream_established_get_a2dp_cid(packet);
+            btstack_run_loop_remove_timer(&avrcp_connect_timer);
+            btstack_run_loop_set_timer_handler(&avrcp_connect_timer, &avrcp_connect_timer_handler);
+            btstack_run_loop_set_timer(&avrcp_connect_timer, AVRCP_CONNECT_DELAY_MS);
+            btstack_run_loop_add_timer(&avrcp_connect_timer);
             break;
 
         case A2DP_SUBEVENT_STREAM_STARTED:
@@ -385,6 +504,7 @@ static void a2dp_sink_packet_handler(uint8_t packet_type, uint16_t channel, uint
             a2dp_connection.a2dp_cid = 0;
             a2dp_connection.connected = 0;
             a2dp_connection.playing = 0;
+            btstack_run_loop_remove_timer(&avrcp_connect_timer);
             media_processing_close();
             sink_status_set_state(SINK_STATE_READY);
             break;
@@ -538,15 +658,32 @@ void sink_setup(const char * local_name, const btstack_audio_sink_t * audio){
 }
 
 void sink_reconnect_last_device(void){
-    bd_addr_t addr;
-    if (!load_last_device(addr)) return;
-    if (a2dp_connection.connected) return;
-    uint16_t cid;
-    log_info("trying to reconnect to %s", bd_addr_to_str(addr));
-    a2dp_sink_establish_stream(addr, &cid);
+    load_last_device();
+    reconnect_blocked = 0;
+    reconnect_attempts = 0;
+    if (have_last_device) log_info("reconnect: last device %s '%s'", bd_addr_to_str(last_device_addr), last_device_name);
+    schedule_reconnect(RECONNECT_FIRST_DELAY_MS);
+}
+
+void sink_set_auto_reconnect(int enabled){
+    enabled = enabled ? 1 : 0;
+    if (enabled == auto_reconnect) return;
+    auto_reconnect = enabled;
+    log_info("reconnect: auto reconnect %s", enabled ? "on" : "off");
+    reconnect_attempts = 0;
+    schedule_reconnect(RECONNECT_FIRST_DELAY_MS);   // clears status if now off
+}
+
+void sink_forget_last_device(void){
+    have_last_device = 0;
+    last_device_name[0] = 0;
+    btstack_run_loop_remove_timer(&reconnect_timer);
+    sink_status_set_reconnecting(NULL);
 }
 
 void sink_disconnect(void){
+    btstack_run_loop_remove_timer(&reconnect_timer);
+    reconnect_blocked = 1;
     if (a2dp_connection.a2dp_cid) a2dp_sink_disconnect(a2dp_connection.a2dp_cid);
     if (avrcp_connection.avrcp_cid) avrcp_disconnect(avrcp_connection.avrcp_cid);
 }
