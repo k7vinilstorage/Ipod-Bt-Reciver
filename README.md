@@ -1,8 +1,8 @@
 # BT Receiver: A2DP sink for a jailbroken iPod touch 5
 
-[![Build](https://github.com/k7vinilstorage/ipod-bt-reciver/actions/workflows/build.yml/badge.svg)](https://github.com/k7vinilstorage/ipod-bt-reciver/actions/workflows/build.yml)
+[![Build](https://github.com/k7vinilstorage/Ipod-Bt-Reciver/actions/workflows/build.yml/badge.svg)](https://github.com/k7vinilstorage/Ipod-Bt-Reciver/actions/workflows/build.yml)
 
-**Download:** get the latest `.deb` from [Releases](https://github.com/k7vinilstorage/ipod-bt-reciver/releases/latest).
+**Download:** get the latest `.deb` from [Releases](https://github.com/k7vinilstorage/Ipod-Bt-Reciver/releases/latest).
 
 Turns an iPod touch 5 (iOS 6 – 9.3.5, jailbroken) into a Bluetooth audio receiver.
 Your phone pairs with it like a speaker, and the music plays through the iPod's
