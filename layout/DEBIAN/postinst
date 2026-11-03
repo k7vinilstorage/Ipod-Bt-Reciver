@@ -1,0 +1,9 @@
+#!/bin/sh
+mkdir -p /var/mobile/Library/A2DPSink
+chown mobile:mobile /var/mobile/Library/A2DPSink
+chmod 755 /var/mobile/Library/A2DPSink
+launchctl unload /Library/LaunchDaemons/local.a2dpsinkd.plist 2>/dev/null
+launchctl load /Library/LaunchDaemons/local.a2dpsinkd.plist
+# register the app on the home screen
+su mobile -c uicache 2>/dev/null || uicache 2>/dev/null
+exit 0

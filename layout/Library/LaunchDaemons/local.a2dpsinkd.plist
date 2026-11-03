@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>local.a2dpsinkd</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/libexec/a2dpsinkd</string>
+	</array>
+	<key>UserName</key>
+	<string>root</string>
+	<!-- run while the app's "Receiver" switch is on (flag file exists) -->
+	<key>KeepAlive</key>
+	<dict>
+		<key>PathState</key>
+		<dict>
+			<key>/var/mobile/Library/A2DPSink/enabled</key>
+			<true/>
+		</dict>
+	</dict>
+	<!-- fallback trigger; the daemon exits at once if the flag is missing -->
+	<key>WatchPaths</key>
+	<array>
+		<string>/var/mobile/Library/A2DPSink</string>
+	</array>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>ExitTimeOut</key>
+	<integer>15</integer>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/bin</string>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>/var/log/a2dpsinkd.log</string>
+	<key>StandardErrorPath</key>
+	<string>/var/log/a2dpsinkd.log</string>
+</dict>
+</plist>

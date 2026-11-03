@@ -1,0 +1,141 @@
+# BT Receiver: A2DP sink for a jailbroken iPod touch 5
+
+Turns an iPod touch 5 (iOS 6 – 9.3.5, jailbroken) into a Bluetooth audio receiver.
+Your phone pairs with it like a speaker, and the music plays through the iPod's
+headphone jack, speaker, or dock line-out. The phone's volume slider and track info
+(title and artist) come through over AVRCP.
+
+> **Status:** the `.deb` builds (armv7, iOS 6.0+). Every function it uses exists on
+> iOS 9.3. It has **not been run on real hardware yet**. See
+> [If it doesn't work](#if-it-doesnt-work).
+
+## Why this needs its own Bluetooth stack
+
+iOS's Bluetooth stack (BTServer) can only *send* audio (A2DP source). It has no receiver
+(sink) role, and no tweak can add one. So this project replaces the stack while the
+receiver is on:
+
+1. **`a2dpsinkd`** (root daemon, `/usr/libexec`) stops Apple's Bluetooth daemons. It
+   powers up the Broadcom BCM4334 chip with Apple's own `BlueTool`, then talks to the
+   chip directly over the UART (through the same netgraph socket BTServer uses).
+2. On top of that it runs [BTstack](https://github.com/bluekitchen/btstack): A2DP sink,
+   AVRCP controller/target, SBC decoder.
+3. Decoded audio goes out through AudioQueue.
+4. When you switch the receiver off, Apple's Bluetooth daemons get started again.
+
+The chip bring-up and UART access come from BTstack's old "BTstack for iOS" Cydia port,
+which supported iOS 9 (in 2015, v1.1). That port never had an A2DP sink. Modern BTstack
+does, so this project combines the two.
+
+The **BT Receiver** app runs as `mobile`. It only creates or removes the flag file
+`/var/mobile/Library/A2DPSink/enabled`. launchd keeps the daemon running while that file
+exists, so the app never needs root.
+
+```
+app (mobile) ──flag file──▶ launchd ──▶ a2dpsinkd (root)
+     ▲                                   │  BlueTool: boot chip
+     └──── status file ◀─────────────────┤  BTstack: HCI ▸ L2CAP ▸ AVDTP/A2DP ▸ SBC
+                                         └─▶ AudioQueue ▶ headphones / speaker
+```
+
+## Build
+
+You need [Theos](https://theos.dev) with a toolchain that can still build **armv7**.
+The easiest is Linux or WSL, using Theos' own toolchain. On macOS, Xcode 14 and later
+cannot build armv7, so you'd need Xcode 13 or older.
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/install-theos)"
+```
+
+Make sure the **iOS 10.3 SDK** is in `$THEOS/sdks`. It's the last SDK that supports
+armv7. The binaries still target iOS 6.0+, so they run on iOS 9. (The 9.3 SDK in that
+repository is missing `liblaunch`.)
+
+```bash
+curl -L https://github.com/theos/sdks/archive/master.tar.gz | tar -xz -C "$THEOS/sdks" --strip-components=1 sdks-master/iPhoneOS10.3.sdk
+```
+
+You also need `rsync` (`sudo apt install rsync`).
+
+Then, inside this folder:
+
+```bash
+./get_btstack.sh
+```
+
+```bash
+make package FINALPACKAGE=1
+```
+
+This produces `packages/local.a2dpsink_0.1.1_iphoneos-arm.deb`.
+
+## Install
+
+With OpenSSH installed on the iPod:
+
+```bash
+make install THEOS_DEVICE_IP=<ipod-ip-address>
+```
+
+Or copy the `.deb` over and run `dpkg -i` on it as root, then `uicache`.
+
+## Use
+
+1. Open **BT Receiver** and switch **Receiver** on. The status changes from
+   *Starting…* to *Waiting for a phone* after a few seconds.
+2. On your phone, pair with **iPod Receiver**. No PIN is needed; old phones get `0000`.
+3. Play music. Next time, the iPod tries to reconnect to the last phone by itself.
+
+While the receiver is on, the iPod's own Bluetooth (Settings) is off, and the iPod is
+kept awake. The screen can turn off, but the device won't sleep, so keep it plugged in.
+The **Name** and **Forget Paired Devices** options are in the app.
+
+## If it doesn't work
+
+The daemon logs to **`/var/log/a2dpsinkd.log`**. To debug by hand over SSH (as root),
+switch the receiver off in the app, then run it in the foreground with an HCI packet log:
+
+```bash
+/usr/libexec/a2dpsinkd -f -d
+```
+
+Press Ctrl+C to stop it. This also hands Bluetooth back to iOS. The packet log is
+`/tmp/a2dpsink.pklg`, which Wireshark can open.
+
+Where things are most likely to break, in order:
+
+| Symptom in the log | Likely cause |
+|---|---|
+| `socket(PF_NETGRAPH) failed` / `ioctl(... com.apple.uart.bluetooth) failed` | Something still holds the UART. Check `ps ax \| grep -i -e blue -e BTServer` |
+| `Bluetooth controller did not respond` | BlueTool bring-up or UART speed. Check the `BlueTool >` lines and `transport-speed` |
+| Connects but no sound | AudioQueue from a daemon. Look for `AudioQueue…failed` lines |
+| Stutters | Raise `OPTIMAL_FRAMES_MIN/MAX` in `daemon/sink.c` |
+
+If iOS Bluetooth stays dead afterwards (for example after a crash), reboot. Or load the
+Apple jobs again by hand:
+
+```bash
+launchctl load /System/Library/LaunchDaemons/com.apple.BTServer.plist
+```
+
+## Files
+
+| Path | What |
+|---|---|
+| `daemon/main.c` | Startup, launchd and flag-file handling, signals, shutdown |
+| `daemon/sink.c` | A2DP sink, AVRCP, SBC decode, clock-drift resampling (from BTstack's `a2dp_sink_demo.c`) |
+| `daemon/btstack_control_ipod.c` | Stops/starts Apple's Bluetooth, configures the chip with BlueTool |
+| `daemon/hci_transport_h4_ipod.c` | H4 over the netgraph UART socket |
+| `daemon/btstack_audio_ios.c` | AudioQueue output (lock-free hand-off between threads) |
+| `daemon/ios9_compat.h` | `clock_gettime` replacement (it only exists on iOS 10+) |
+| `app/` | The BT Receiver settings app |
+| `layout/` | LaunchDaemon plist, Debian install scripts |
+| `stubs/` | iOS 9.3 library stubs for armv7-only functions missing from the 10.3 SDK (`__divsi3`, `objc_msgSend_stret`, …) |
+
+## License
+
+BTstack and the code derived from it (the iOS chip control and transport, and the sink
+logic) are under the [BTstack license](https://github.com/bluekitchen/btstack/blob/master/LICENSE):
+free for **non-commercial / personal** use. Keep this project personal, or get a
+commercial license from BlueKitchen.

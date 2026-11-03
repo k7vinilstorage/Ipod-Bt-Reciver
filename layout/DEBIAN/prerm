@@ -1,0 +1,11 @@
+#!/bin/sh
+# switch the receiver off; SIGTERM makes the daemon hand Bluetooth back to iOS
+rm -f /var/mobile/Library/A2DPSink/enabled
+launchctl unload /Library/LaunchDaemons/local.a2dpsinkd.plist 2>/dev/null
+sleep 2
+# belt and braces: make sure Apple's Bluetooth daemons are loaded again
+for job in com.apple.BlueTool com.apple.bluetoothd com.apple.BTLEServer com.apple.BTServer.le com.apple.BTServer; do
+    plist=/System/Library/LaunchDaemons/$job.plist
+    [ -f "$plist" ] && launchctl load "$plist" 2>/dev/null
+done
+exit 0

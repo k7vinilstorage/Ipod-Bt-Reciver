@@ -1,0 +1,556 @@
+/*
+ * sink.c - A2DP Sink + AVRCP Controller/Target
+ *
+ * Adapted from BTstack's example/a2dp_sink_demo.c (BlueKitchen GmbH, BTstack license),
+ * trimmed to what a headless receiver needs, plus status reporting for the app.
+ *
+ * Media path: L2CAP media packets -> SBC frames into a ring buffer -> decoded on demand
+ * when the audio driver asks for PCM -> resampled slightly faster/slower to keep the
+ * buffer level stable (phone and iPod clocks drift) -> AudioQueue.
+ */
+
+#include "btstack_config.h"
+
+#include <inttypes.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "btstack.h"
+#include "btstack_resample.h"
+#include "btstack_ring_buffer.h"
+
+#include "sink.h"
+#include "sink_status.h"
+
+#define NUM_CHANNELS                   2
+#define BYTES_PER_FRAME                (2 * NUM_CHANNELS)
+#define MAX_SBC_FRAME_SIZE             120
+#define SBC_MAX_AUDIO_FRAMES_PER_BLOCK 128
+#define RESAMPLE_ADDITIONAL_FRAMES     16
+#define RESAMPLE_OUTPUT_FRAMES         (SBC_MAX_AUDIO_FRAMES_PER_BLOCK + RESAMPLE_ADDITIONAL_FRAMES)
+
+// SBC frames buffered: below MIN stretch, above MAX compress
+#define OPTIMAL_FRAMES_MIN 60
+#define OPTIMAL_FRAMES_MAX 80
+#define ADDITIONAL_FRAMES  30
+
+static btstack_packet_callback_registration_t hci_event_callback_registration;
+
+static uint8_t sdp_avdtp_sink_service_buffer[150];
+static uint8_t sdp_avrcp_target_service_buffer[150];
+static uint8_t sdp_avrcp_controller_service_buffer[200];
+static uint8_t device_id_sdp_service_buffer[100];
+
+// accept all SBC configurations, bitpool 2-53
+static uint8_t media_sbc_codec_capabilities[] = { 0xFF, 0xFF, 2, 53 };
+
+static const btstack_sbc_decoder_t *   sbc_decoder_instance;
+static btstack_sbc_decoder_bluedroid_t sbc_decoder_context;
+
+static uint8_t sbc_frame_storage[(OPTIMAL_FRAMES_MAX + ADDITIONAL_FRAMES) * MAX_SBC_FRAME_SIZE];
+static btstack_ring_buffer_t sbc_frame_ring_buffer;
+static unsigned int sbc_frame_size;
+
+static uint8_t decoded_audio_storage[RESAMPLE_OUTPUT_FRAMES * BYTES_PER_FRAME];
+static btstack_ring_buffer_t decoded_audio_ring_buffer;
+
+static int media_initialized;
+static int audio_stream_started;
+static btstack_resample_t resample_instance;
+static uint32_t resampling_min_factor;
+
+static int16_t * request_buffer;
+static int       request_frames;
+
+static int volume_percentage = 100;
+
+typedef struct {
+    uint8_t  reconfigure;
+    uint8_t  num_channels;
+    uint16_t sampling_frequency;
+    uint8_t  block_length;
+    uint8_t  subbands;
+    uint8_t  min_bitpool_value;
+    uint8_t  max_bitpool_value;
+    btstack_sbc_channel_mode_t      channel_mode;
+    btstack_sbc_allocation_method_t allocation_method;
+} media_codec_configuration_sbc_t;
+
+static struct {
+    uint8_t  a2dp_local_seid;
+    uint8_t  media_sbc_codec_configuration[4];
+} stream_endpoint;
+
+static struct {
+    bd_addr_t addr;
+    uint16_t  a2dp_cid;
+    int       connected;
+    int       playing;
+    media_codec_configuration_sbc_t sbc_configuration;
+} a2dp_connection;
+
+static struct {
+    uint16_t avrcp_cid;
+} avrcp_connection;
+
+static const btstack_audio_sink_t * audio_sink;
+
+// --- persistence of last device, for reconnect on start ---
+
+static void save_last_device(const bd_addr_t addr){
+    FILE * f = fopen(SINK_LAST_DEVICE, "w");
+    if (!f) return;
+    fprintf(f, "%s\n", bd_addr_to_str(addr));
+    fclose(f);
+}
+
+static int load_last_device(bd_addr_t addr){
+    char line[32];
+    FILE * f = fopen(SINK_LAST_DEVICE, "r");
+    if (!f) return 0;
+    int ok = fgets(line, sizeof(line), f) != NULL;
+    fclose(f);
+    if (!ok) return 0;
+    line[strcspn(line, "\r\n")] = 0;
+    return sscanf_bd_addr(line, addr);
+}
+
+// --- audio pipeline ---
+
+static void playback_handler(int16_t * buffer, uint16_t num_audio_frames, const btstack_audio_context_t * context){
+    UNUSED(context);
+
+    if (sbc_frame_size == 0){
+        memset(buffer, 0, num_audio_frames * BYTES_PER_FRAME);
+        return;
+    }
+
+    // first from resampled leftovers
+    uint32_t bytes_read;
+    btstack_ring_buffer_read(&decoded_audio_ring_buffer, (uint8_t *) buffer, num_audio_frames * BYTES_PER_FRAME, &bytes_read);
+    buffer           += bytes_read / NUM_CHANNELS;
+    num_audio_frames -= bytes_read / BYTES_PER_FRAME;
+
+    // then decode SBC frames straight into the request buffer
+    request_buffer = buffer;
+    request_frames = num_audio_frames;
+    while (request_frames && btstack_ring_buffer_bytes_available(&sbc_frame_ring_buffer) >= sbc_frame_size){
+        uint8_t sbc_frame[MAX_SBC_FRAME_SIZE];
+        btstack_ring_buffer_read(&sbc_frame_ring_buffer, sbc_frame, sbc_frame_size, &bytes_read);
+        sbc_decoder_instance->decode_signed_16(&sbc_decoder_context, 0, sbc_frame, sbc_frame_size);
+    }
+
+    // buffer ran dry: fill rest with silence
+    if (request_frames > 0){
+        memset(request_buffer, 0, request_frames * BYTES_PER_FRAME);
+        request_frames = 0;
+    }
+}
+
+static void handle_pcm_data(int16_t * data, int num_audio_frames, int num_channels, int sample_rate, void * context){
+    UNUSED(sample_rate); UNUSED(context); UNUSED(num_channels);
+
+    int16_t  output_buffer[RESAMPLE_OUTPUT_FRAMES * NUM_CHANNELS];
+    uint32_t resampled_frames = btstack_resample_block(&resample_instance, data, num_audio_frames, output_buffer);
+
+    int frames_to_copy = btstack_min(resampled_frames, request_frames);
+    memcpy(request_buffer, output_buffer, frames_to_copy * BYTES_PER_FRAME);
+    request_frames -= frames_to_copy;
+    request_buffer += frames_to_copy * NUM_CHANNELS;
+
+    int frames_to_store = resampled_frames - frames_to_copy;
+    if (frames_to_store){
+        if (btstack_ring_buffer_write(&decoded_audio_ring_buffer, (uint8_t *) &output_buffer[frames_to_copy * NUM_CHANNELS],
+                                      frames_to_store * BYTES_PER_FRAME)){
+            log_error("PCM ring buffer full");
+        }
+    }
+}
+
+static void media_processing_init(media_codec_configuration_sbc_t * configuration){
+    if (media_initialized) return;
+    sbc_decoder_instance = btstack_sbc_decoder_bluedroid_init_instance(&sbc_decoder_context);
+    sbc_decoder_instance->configure(&sbc_decoder_context, SBC_MODE_STANDARD, handle_pcm_data, NULL);
+
+    btstack_ring_buffer_init(&sbc_frame_ring_buffer, sbc_frame_storage, sizeof(sbc_frame_storage));
+    btstack_ring_buffer_init(&decoded_audio_ring_buffer, decoded_audio_storage, sizeof(decoded_audio_storage));
+    btstack_resample_init(&resample_instance, configuration->num_channels);
+    resampling_min_factor = btstack_resample_get_min_factor_for_output_capacity(SBC_MAX_AUDIO_FRAMES_PER_BLOCK, RESAMPLE_OUTPUT_FRAMES);
+
+    if (audio_sink){
+        audio_sink->init(NUM_CHANNELS, configuration->sampling_frequency, &playback_handler);
+        audio_sink->set_volume(volume_percentage * 127 / 100);
+    }
+    audio_stream_started = 0;
+    media_initialized = 1;
+}
+
+static void media_processing_start(void){
+    if (!media_initialized) return;
+    if (audio_sink) audio_sink->start_stream();
+    audio_stream_started = 1;
+}
+
+static void media_processing_pause(void){
+    if (!media_initialized) return;
+    audio_stream_started = 0;
+    if (audio_sink) audio_sink->stop_stream();
+    btstack_ring_buffer_reset(&decoded_audio_ring_buffer);
+    btstack_ring_buffer_reset(&sbc_frame_ring_buffer);
+}
+
+static void media_processing_close(void){
+    if (!media_initialized) return;
+    media_initialized = 0;
+    audio_stream_started = 0;
+    sbc_frame_size = 0;
+    if (audio_sink) audio_sink->close();
+}
+
+static int read_media_data_header(uint8_t * packet, int size, int * offset){
+    // RTP header without CSRC list: 12 bytes
+    UNUSED(packet);
+    if (size - *offset < 12) return 0;
+    *offset += 12;
+    return 1;
+}
+
+static int read_sbc_header(uint8_t * packet, int size, int * offset, uint8_t * num_frames){
+    if (size - *offset < 1) return 0;
+    *num_frames = packet[*offset] & 0x0f;
+    *offset += 1;
+    return *num_frames != 0;
+}
+
+static void handle_l2cap_media_data_packet(uint8_t seid, uint8_t * packet, uint16_t size){
+    UNUSED(seid);
+    int pos = 0;
+    uint8_t num_frames;
+    if (!read_media_data_header(packet, size, &pos)) return;
+    if (!read_sbc_header(packet, size, &pos, &num_frames)) return;
+    if (!media_initialized) return;
+
+    int packet_length = size - pos;
+    uint8_t * packet_begin = packet + pos;
+
+    sbc_frame_size = packet_length / num_frames;
+    if (sbc_frame_size == 0 || sbc_frame_size > MAX_SBC_FRAME_SIZE){
+        sbc_frame_size = 0;
+        return;
+    }
+    if (btstack_ring_buffer_write(&sbc_frame_ring_buffer, packet_begin, packet_length) != ERROR_CODE_SUCCESS){
+        log_error("SBC ring buffer full");
+    }
+
+    // keep buffer level in the optimal window by resampling a tiny bit
+    int sbc_frames_in_buffer = btstack_ring_buffer_bytes_available(&sbc_frame_ring_buffer) / sbc_frame_size;
+    const uint32_t nominal_factor = 0x10000;
+    const uint32_t compensation   = 0x00100;
+    uint32_t resampling_factor;
+    if (sbc_frames_in_buffer < OPTIMAL_FRAMES_MIN){
+        resampling_factor = nominal_factor - compensation;
+    } else if (sbc_frames_in_buffer <= OPTIMAL_FRAMES_MAX){
+        resampling_factor = nominal_factor;
+    } else {
+        resampling_factor = nominal_factor + compensation;
+    }
+    btstack_resample_set_factor(&resample_instance, btstack_max(resampling_factor, resampling_min_factor));
+
+    if (!audio_stream_started && sbc_frames_in_buffer >= OPTIMAL_FRAMES_MIN){
+        media_processing_start();
+    }
+}
+
+// --- volume ---
+
+static void apply_volume(uint8_t avrcp_volume){
+    volume_percentage = avrcp_volume * 100 / 127;
+    if (audio_sink) audio_sink->set_volume(avrcp_volume);
+}
+
+static void set_volume_percentage(int new_percentage){
+    volume_percentage = btstack_max(0, btstack_min(100, new_percentage));
+    uint8_t volume = volume_percentage * 127 / 100;
+    if (avrcp_connection.avrcp_cid) avrcp_target_volume_changed(avrcp_connection.avrcp_cid, volume);
+    if (audio_sink) audio_sink->set_volume(volume);
+}
+
+// --- event handlers ---
+
+static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t * packet, uint16_t size){
+    UNUSED(channel); UNUSED(size);
+    if (packet_type != HCI_EVENT_PACKET) return;
+
+    bd_addr_t address;
+    switch (hci_event_packet_get_type(packet)){
+        case HCI_EVENT_PIN_CODE_REQUEST:
+            // phones from before Bluetooth 2.1: use the classic speaker PIN
+            hci_event_pin_code_request_get_bd_addr(packet, address);
+            log_info("legacy pairing with %s, using PIN 0000", bd_addr_to_str(address));
+            gap_pin_code_response(address, "0000");
+            break;
+        case HCI_EVENT_USER_CONFIRMATION_REQUEST:
+            // headless receiver: accept like any Bluetooth speaker
+            hci_event_user_confirmation_request_get_bd_addr(packet, address);
+            log_info("SSP pairing with %s, accepting", bd_addr_to_str(address));
+            gap_ssp_confirmation_response(address);
+            break;
+        case HCI_EVENT_REMOTE_NAME_REQUEST_COMPLETE:
+            if (hci_event_remote_name_request_complete_get_status(packet) != ERROR_CODE_SUCCESS) break;
+            hci_event_remote_name_request_complete_get_bd_addr(packet, address);
+            if (a2dp_connection.connected && bd_addr_cmp(address, a2dp_connection.addr) == 0){
+                sink_status_set_remote(NULL, hci_event_remote_name_request_complete_get_remote_name(packet));
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+static void a2dp_sink_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t * packet, uint16_t size){
+    UNUSED(channel); UNUSED(size);
+    if (packet_type != HCI_EVENT_PACKET) return;
+    if (hci_event_packet_get_type(packet) != HCI_EVENT_A2DP_META) return;
+
+    char codec[64];
+    bd_addr_t address;
+    media_codec_configuration_sbc_t * sbc = &a2dp_connection.sbc_configuration;
+
+    switch (packet[2]){
+        case A2DP_SUBEVENT_SIGNALING_CONNECTION_ESTABLISHED:
+            if (a2dp_subevent_signaling_connection_established_get_status(packet) != ERROR_CODE_SUCCESS){
+                log_info("A2DP connection failed");
+                break;
+            }
+            a2dp_subevent_signaling_connection_established_get_bd_addr(packet, address);
+            memcpy(a2dp_connection.addr, address, 6);
+            a2dp_connection.a2dp_cid = a2dp_subevent_signaling_connection_established_get_a2dp_cid(packet);
+            a2dp_connection.connected = 1;
+            log_info("A2DP connected to %s", bd_addr_to_str(address));
+            save_last_device(address);
+            sink_status_set_state(SINK_STATE_CONNECTED);
+            sink_status_set_remote(bd_addr_to_str(address), "");
+            gap_remote_name_request(address, 0x01, 0);
+            break;
+
+        case A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_SBC_CONFIGURATION: {
+            sbc->reconfigure        = a2dp_subevent_signaling_media_codec_sbc_configuration_get_reconfigure(packet);
+            sbc->num_channels       = a2dp_subevent_signaling_media_codec_sbc_configuration_get_num_channels(packet);
+            sbc->sampling_frequency = a2dp_subevent_signaling_media_codec_sbc_configuration_get_sampling_frequency(packet);
+            sbc->block_length       = a2dp_subevent_signaling_media_codec_sbc_configuration_get_block_length(packet);
+            sbc->subbands           = a2dp_subevent_signaling_media_codec_sbc_configuration_get_subbands(packet);
+            sbc->min_bitpool_value  = a2dp_subevent_signaling_media_codec_sbc_configuration_get_min_bitpool_value(packet);
+            sbc->max_bitpool_value  = a2dp_subevent_signaling_media_codec_sbc_configuration_get_max_bitpool_value(packet);
+            sbc->allocation_method  = (btstack_sbc_allocation_method_t)(a2dp_subevent_signaling_media_codec_sbc_configuration_get_allocation_method(packet) - 1);
+            switch (a2dp_subevent_signaling_media_codec_sbc_configuration_get_channel_mode(packet)){
+                case AVDTP_CHANNEL_MODE_JOINT_STEREO: sbc->channel_mode = SBC_CHANNEL_MODE_JOINT_STEREO; break;
+                case AVDTP_CHANNEL_MODE_STEREO:       sbc->channel_mode = SBC_CHANNEL_MODE_STEREO;       break;
+                case AVDTP_CHANNEL_MODE_DUAL_CHANNEL: sbc->channel_mode = SBC_CHANNEL_MODE_DUAL_CHANNEL; break;
+                default:                              sbc->channel_mode = SBC_CHANNEL_MODE_MONO;         break;
+            }
+            snprintf(codec, sizeof(codec), "SBC %u Hz, %s, bitpool %u-%u", sbc->sampling_frequency,
+                     sbc->num_channels == 1 ? "mono" : "stereo", sbc->min_bitpool_value, sbc->max_bitpool_value);
+            log_info("codec: %s", codec);
+            sink_status_set_codec(codec);
+            break;
+        }
+
+        case A2DP_SUBEVENT_STREAM_ESTABLISHED:
+            if (a2dp_subevent_stream_established_get_status(packet) != ERROR_CODE_SUCCESS) break;
+            a2dp_connection.a2dp_cid = a2dp_subevent_stream_established_get_a2dp_cid(packet);
+            break;
+
+        case A2DP_SUBEVENT_STREAM_STARTED:
+            a2dp_connection.playing = 1;
+            if (sbc->reconfigure) media_processing_close();
+            media_processing_init(sbc);   // audio starts once enough frames are buffered
+            sink_status_set_state(SINK_STATE_PLAYING);
+            break;
+
+        case A2DP_SUBEVENT_STREAM_SUSPENDED:
+            a2dp_connection.playing = 0;
+            media_processing_pause();
+            sink_status_set_state(SINK_STATE_CONNECTED);
+            break;
+
+        case A2DP_SUBEVENT_STREAM_RELEASED:
+            a2dp_connection.playing = 0;
+            media_processing_close();
+            if (a2dp_connection.connected) sink_status_set_state(SINK_STATE_CONNECTED);
+            break;
+
+        case A2DP_SUBEVENT_SIGNALING_CONNECTION_RELEASED:
+            log_info("A2DP disconnected");
+            a2dp_connection.a2dp_cid = 0;
+            a2dp_connection.connected = 0;
+            a2dp_connection.playing = 0;
+            media_processing_close();
+            sink_status_set_state(SINK_STATE_READY);
+            break;
+
+        default:
+            break;
+    }
+}
+
+static void avrcp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t * packet, uint16_t size){
+    UNUSED(channel); UNUSED(size);
+    if (packet_type != HCI_EVENT_PACKET) return;
+    if (hci_event_packet_get_type(packet) != HCI_EVENT_AVRCP_META) return;
+
+    switch (packet[2]){
+        case AVRCP_SUBEVENT_CONNECTION_ESTABLISHED:
+            if (avrcp_subevent_connection_established_get_status(packet) != ERROR_CODE_SUCCESS){
+                avrcp_connection.avrcp_cid = 0;
+                return;
+            }
+            avrcp_connection.avrcp_cid = avrcp_subevent_connection_established_get_avrcp_cid(packet);
+            avrcp_target_support_event(avrcp_connection.avrcp_cid, AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED);
+            avrcp_target_support_event(avrcp_connection.avrcp_cid, AVRCP_NOTIFICATION_EVENT_BATT_STATUS_CHANGED);
+            avrcp_target_battery_status_changed(avrcp_connection.avrcp_cid, AVRCP_BATTERY_STATUS_EXTERNAL);
+            avrcp_controller_get_supported_events(avrcp_connection.avrcp_cid);
+            break;
+        case AVRCP_SUBEVENT_CONNECTION_RELEASED:
+            avrcp_connection.avrcp_cid = 0;
+            break;
+        default:
+            break;
+    }
+}
+
+static void copy_avrcp_value(char * dst, size_t dst_size, const uint8_t * value, uint16_t len){
+    size_t n = btstack_min(len, dst_size - 1);
+    memcpy(dst, value, n);
+    dst[n] = 0;
+}
+
+static void avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t * packet, uint16_t size){
+    UNUSED(channel); UNUSED(size);
+    if (packet_type != HCI_EVENT_PACKET) return;
+    if (hci_event_packet_get_type(packet) != HCI_EVENT_AVRCP_META) return;
+    if (avrcp_connection.avrcp_cid == 0) return;
+
+    char value[128];
+    switch (packet[2]){
+        case AVRCP_SUBEVENT_GET_CAPABILITY_EVENT_ID_DONE:
+            avrcp_controller_enable_notification(avrcp_connection.avrcp_cid, AVRCP_NOTIFICATION_EVENT_PLAYBACK_STATUS_CHANGED);
+            avrcp_controller_enable_notification(avrcp_connection.avrcp_cid, AVRCP_NOTIFICATION_EVENT_TRACK_CHANGED);
+            avrcp_controller_get_now_playing_info(avrcp_connection.avrcp_cid);
+            break;
+        case AVRCP_SUBEVENT_NOTIFICATION_TRACK_CHANGED:
+            avrcp_controller_get_now_playing_info(avrcp_connection.avrcp_cid);
+            break;
+        case AVRCP_SUBEVENT_NOW_PLAYING_TITLE_INFO:
+            copy_avrcp_value(value, sizeof(value), avrcp_subevent_now_playing_title_info_get_value(packet),
+                             avrcp_subevent_now_playing_title_info_get_value_len(packet));
+            sink_status_set_track(value, NULL);
+            break;
+        case AVRCP_SUBEVENT_NOW_PLAYING_ARTIST_INFO:
+            copy_avrcp_value(value, sizeof(value), avrcp_subevent_now_playing_artist_info_get_value(packet),
+                             avrcp_subevent_now_playing_artist_info_get_value_len(packet));
+            sink_status_set_track(NULL, value);
+            break;
+        default:
+            break;
+    }
+}
+
+static void avrcp_target_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t * packet, uint16_t size){
+    UNUSED(channel); UNUSED(size);
+    if (packet_type != HCI_EVENT_PACKET) return;
+    if (hci_event_packet_get_type(packet) != HCI_EVENT_AVRCP_META) return;
+
+    switch (packet[2]){
+        case AVRCP_SUBEVENT_NOTIFICATION_VOLUME_CHANGED:
+            // phone moved its volume slider (absolute volume)
+            apply_volume(avrcp_subevent_notification_volume_changed_get_absolute_volume(packet));
+            break;
+        case AVRCP_SUBEVENT_OPERATION:
+            if (avrcp_subevent_operation_get_button_pressed(packet) == 0) break;
+            switch ((avrcp_operation_id_t) avrcp_subevent_operation_get_operation_id(packet)){
+                case AVRCP_OPERATION_ID_VOLUME_UP:   set_volume_percentage(volume_percentage + 10); break;
+                case AVRCP_OPERATION_ID_VOLUME_DOWN: set_volume_percentage(volume_percentage - 10); break;
+                default: break;
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+// --- public ---
+
+void sink_setup(const char * local_name, const btstack_audio_sink_t * audio){
+    audio_sink = audio;
+
+    l2cap_init();
+    sdp_init();
+
+    a2dp_sink_init();
+    avrcp_init();
+    avrcp_controller_init();
+    avrcp_target_init();
+
+    a2dp_sink_register_packet_handler(&a2dp_sink_packet_handler);
+    a2dp_sink_register_media_handler(&handle_l2cap_media_data_packet);
+    avdtp_stream_endpoint_t * local_stream_endpoint = a2dp_sink_create_stream_endpoint(AVDTP_AUDIO,
+        AVDTP_CODEC_SBC, media_sbc_codec_capabilities, sizeof(media_sbc_codec_capabilities),
+        stream_endpoint.media_sbc_codec_configuration, sizeof(stream_endpoint.media_sbc_codec_configuration));
+    btstack_assert(local_stream_endpoint != NULL);
+    stream_endpoint.a2dp_local_seid = avdtp_local_seid(local_stream_endpoint);
+
+    avrcp_register_packet_handler(&avrcp_packet_handler);
+    avrcp_controller_register_packet_handler(&avrcp_controller_packet_handler);
+    avrcp_target_register_packet_handler(&avrcp_target_packet_handler);
+
+    // SDP records: A2DP sink (speaker), AVRCP controller + target, Device ID
+    memset(sdp_avdtp_sink_service_buffer, 0, sizeof(sdp_avdtp_sink_service_buffer));
+    a2dp_sink_create_sdp_record(sdp_avdtp_sink_service_buffer, sdp_create_service_record_handle(),
+                                AVDTP_SINK_FEATURE_MASK_SPEAKER, NULL, NULL);
+    sdp_register_service(sdp_avdtp_sink_service_buffer);
+
+    memset(sdp_avrcp_controller_service_buffer, 0, sizeof(sdp_avrcp_controller_service_buffer));
+    avrcp_controller_create_sdp_record(sdp_avrcp_controller_service_buffer, sdp_create_service_record_handle(),
+                                       1 << AVRCP_CONTROLLER_SUPPORTED_FEATURE_CATEGORY_PLAYER_OR_RECORDER, NULL, NULL);
+    sdp_register_service(sdp_avrcp_controller_service_buffer);
+
+    memset(sdp_avrcp_target_service_buffer, 0, sizeof(sdp_avrcp_target_service_buffer));
+    avrcp_target_create_sdp_record(sdp_avrcp_target_service_buffer, sdp_create_service_record_handle(),
+                                   1 << AVRCP_TARGET_SUPPORTED_FEATURE_CATEGORY_MONITOR_OR_AMPLIFIER, NULL, NULL);
+    sdp_register_service(sdp_avrcp_target_service_buffer);
+
+    memset(device_id_sdp_service_buffer, 0, sizeof(device_id_sdp_service_buffer));
+    device_id_create_sdp_record(device_id_sdp_service_buffer, sdp_create_service_record_handle(),
+                                DEVICE_ID_VENDOR_ID_SOURCE_BLUETOOTH, BLUETOOTH_COMPANY_ID_BLUEKITCHEN_GMBH, 1, 1);
+    sdp_register_service(device_id_sdp_service_buffer);
+
+    // GAP: show up as a loudspeaker, pair without user interaction
+    gap_set_local_name(local_name);
+    gap_discoverable_control(1);
+    gap_set_class_of_device(0x240414);   // Audio/Rendering service, Audio/Video major, Loudspeaker minor
+    gap_ssp_set_io_capability(SSP_IO_CAPABILITY_NO_INPUT_NO_OUTPUT);
+    gap_set_default_link_policy_settings(LM_LINK_POLICY_ENABLE_ROLE_SWITCH | LM_LINK_POLICY_ENABLE_SNIFF_MODE);
+    gap_set_allow_role_switch(true);
+
+    hci_event_callback_registration.callback = &hci_packet_handler;
+    hci_add_event_handler(&hci_event_callback_registration);
+}
+
+void sink_reconnect_last_device(void){
+    bd_addr_t addr;
+    if (!load_last_device(addr)) return;
+    if (a2dp_connection.connected) return;
+    uint16_t cid;
+    log_info("trying to reconnect to %s", bd_addr_to_str(addr));
+    a2dp_sink_establish_stream(addr, &cid);
+}
+
+void sink_disconnect(void){
+    if (a2dp_connection.a2dp_cid) a2dp_sink_disconnect(a2dp_connection.a2dp_cid);
+    if (avrcp_connection.avrcp_cid) avrcp_disconnect(avrcp_connection.avrcp_cid);
+}
+
+void sink_shutdown_audio(void){
+    media_processing_close();
+}
