@@ -45,8 +45,11 @@ app (mobile) ──flag file──▶ launchd ──▶ a2dpsinkd (root)
 ## Build
 
 Every push is built by GitHub Actions (`.github/workflows/build.yml`), using the same
-pinned Theos, toolchain and SDK. The `.deb` is available as a workflow artifact. Pushing
-a tag `vX.Y.Z` that matches `Version:` in `control` publishes a release.
+pinned Theos, toolchain and SDK. The `.deb` is available as a workflow artifact.
+
+To publish a release: bump `Version:` in `control`, push, then in the **Actions** tab
+pick **Build → Run workflow**, tick **Publish release** and run it. That creates the tag
+`v<Version>` and the release with the `.deb`. Pushing a matching `vX.Y.Z` tag also works.
 
 To build locally:
 
