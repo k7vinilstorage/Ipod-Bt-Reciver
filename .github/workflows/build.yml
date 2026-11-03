@@ -135,15 +135,10 @@ jobs:
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:
-      contents: read
-      pages: write
-      id-token: write
+      contents: write          # push the gh-pages branch (no Pages API needed)
     concurrency:
-      group: pages
+      group: cydia-repo
       cancel-in-progress: false
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - name: Check out
         uses: actions/checkout@v4
@@ -163,6 +158,8 @@ jobs:
         run: |
           mkdir -p repo/debs
           cp debs/*.deb repo/debs/
+          cp .github/repo-index.html repo/index.html
+          touch repo/.nojekyll
           cd repo
           dpkg-scanpackages -m debs > Packages
           bzip2 -kf Packages
@@ -177,19 +174,21 @@ jobs:
             echo "Components: main"
             echo "Description: Bluetooth A2DP receiver for a jailbroken iPod touch 5"
           } > Release
-          cp "$GITHUB_WORKSPACE/.github/repo-index.html" index.html
           echo "--- Packages ---"; cat Packages
 
-      - name: Configure Pages
-        uses: actions/configure-pages@v5
-        with:
-          enablement: true
-
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: repo
-
-      - name: Deploy to Pages
-        id: deploy
-        uses: actions/deploy-pages@v4
+      - name: Publish to gh-pages branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd repo
+          git init -q
+          git checkout -q -b gh-pages
+          git -c user.email=noreply@github.com -c user.name="github-actions[bot]" \
+            add -A
+          git -c user.email=noreply@github.com -c user.name="github-actions[bot]" \
+            commit -q -m "Cydia repo for ${GITHUB_SHA::7}"
+          git push -q -f \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            gh-pages
+          echo "Pushed Cydia repo to the gh-pages branch."
+          echo "Enable Pages once: Settings -> Pages -> Source: Deploy from a branch -> gh-pages / root."

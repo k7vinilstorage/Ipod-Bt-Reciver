@@ -6,6 +6,10 @@
 `https://k7vinilstorage.github.io/Ipod-Bt-Reciver/`, then install **BT Receiver (A2DP Sink)**.
 Or download the latest `.deb` from [Releases](https://github.com/k7vinilstorage/Ipod-Bt-Reciver/releases/latest).
 
+> First-time repo setup (once, by the repo owner): CI pushes the Cydia repo to the
+> `gh-pages` branch. Enable it under **Settings → Pages → Source: Deploy from a branch →
+> `gh-pages` / `root`**. After a minute the `github.io` URL above serves the repo.
+
 Turns an iPod touch 5 (iOS 6 – 9.3.5, jailbroken) into a Bluetooth audio receiver.
 Your phone pairs with it like a speaker, and the music plays through the iPod's
 headphone jack, speaker, or dock line-out. The phone's volume slider and track info
