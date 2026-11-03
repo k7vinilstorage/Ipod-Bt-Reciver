@@ -25,9 +25,9 @@
 #define MAX_CHANNELS          2
 #define FRAMES_PER_CHUNK      256      // what we ask the A2DP code for at a time
 #define FRAMES_PER_AQ_BUFFER  1024     // ~23 ms at 44.1 kHz
-#define NUM_AQ_BUFFERS        3
-#define RING_FRAMES           4096     // power of two, ~93 ms at 44.1 kHz
-#define RING_TARGET_FRAMES    (FRAMES_PER_AQ_BUFFER * 2 + FRAMES_PER_CHUNK)
+#define NUM_AQ_BUFFERS        4
+#define RING_FRAMES           8192     // power of two, ~186 ms at 44.1 kHz
+#define RING_TARGET_FRAMES    (FRAMES_PER_AQ_BUFFER * 3 + FRAMES_PER_CHUNK)
 #define FILL_TIMER_MS         5
 
 static void (*playback_callback)(int16_t * buffer, uint16_t num_samples, const btstack_audio_context_t * context);

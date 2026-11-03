@@ -4,6 +4,9 @@ name: Build
 # A release with the .deb attached is published either by pushing a tag like v0.2.0, or
 # from the Actions tab: "Run workflow" with "Publish release" ticked (tag v<Version from
 # control> is then created on the built commit).
+#
+# Every build of main (and every tag) also republishes the Cydia repository to GitHub
+# Pages, so the iPod can install/update straight from Cydia.
 on:
   push:
     branches: [main]
@@ -126,3 +129,67 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "iPod BT Receiver $tag" \
             --notes-file .github/release-notes.md
+
+  cydia-repo:
+    needs: build
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install repo tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends dpkg-dev bzip2
+
+      - name: Download built package
+        uses: actions/download-artifact@v4
+        with:
+          name: deb
+          path: debs
+
+      - name: Build Cydia repository
+        run: |
+          mkdir -p repo/debs
+          cp debs/*.deb repo/debs/
+          cd repo
+          dpkg-scanpackages -m debs > Packages
+          bzip2 -kf Packages
+          gzip  -kf Packages
+          {
+            echo "Origin: iPod BT Receiver"
+            echo "Label: iPod BT Receiver"
+            echo "Suite: stable"
+            echo "Version: 1.0"
+            echo "Codename: ios"
+            echo "Architectures: iphoneos-arm"
+            echo "Components: main"
+            echo "Description: Bluetooth A2DP receiver for a jailbroken iPod touch 5"
+          } > Release
+          cp "$GITHUB_WORKSPACE/.github/repo-index.html" index.html
+          echo "--- Packages ---"; cat Packages
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: repo
+
+      - name: Deploy to Pages
+        id: deploy
+        uses: actions/deploy-pages@v4

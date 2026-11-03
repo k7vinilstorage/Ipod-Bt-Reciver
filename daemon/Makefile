@@ -12,7 +12,8 @@ a2dpsinkd_CFLAGS = -I. -include ios9_compat.h $(addprefix -I$(BTSTACK_ROOT)/,$(B
 	-Wno-unused-parameter -Wno-sign-compare -Wno-missing-field-initializers -Wno-deprecated-declarations -Wno-error
 # armv7 has no hardware divide: link the iOS 9.3 compiler_rt stub (the 10.3 SDK one lacks the armv7 helpers)
 a2dpsinkd_LDFLAGS = ../stubs/libcompiler_rt.tbd
-a2dpsinkd_FRAMEWORKS = CoreFoundation AudioToolbox IOKit
+a2dpsinkd_FRAMEWORKS = CoreFoundation Foundation AudioToolbox MediaPlayer IOKit
+a2dpsinkd_PRIVATE_FRAMEWORKS = MediaRemote
 a2dpsinkd_INSTALL_PATH = /usr/libexec
 
 include $(THEOS_MAKE_PATH)/tool.mk

@@ -2,7 +2,9 @@
 
 [![Build](https://github.com/k7vinilstorage/Ipod-Bt-Reciver/actions/workflows/build.yml/badge.svg)](https://github.com/k7vinilstorage/Ipod-Bt-Reciver/actions/workflows/build.yml)
 
-**Download:** get the latest `.deb` from [Releases](https://github.com/k7vinilstorage/Ipod-Bt-Reciver/releases/latest).
+**Install on the iPod (Cydia repo):** in Cydia, *Sources → Edit → Add* and enter
+`https://k7vinilstorage.github.io/Ipod-Bt-Reciver/`, then install **BT Receiver (A2DP Sink)**.
+Or download the latest `.deb` from [Releases](https://github.com/k7vinilstorage/Ipod-Bt-Reciver/releases/latest).
 
 Turns an iPod touch 5 (iOS 6 – 9.3.5, jailbroken) into a Bluetooth audio receiver.
 Your phone pairs with it like a speaker, and the music plays through the iPod's
@@ -81,7 +83,7 @@ Then, inside this folder:
 make package FINALPACKAGE=1
 ```
 
-This produces `packages/local.a2dpsink_0.3.0_iphoneos-arm.deb`.
+This produces `packages/local.a2dpsink_0.4.0_iphoneos-arm.deb`.
 
 ## Install
 
@@ -117,6 +119,11 @@ kept awake. The screen can turn off, but the device won't sleep, so keep it plug
 - **Auto Play on Connect** (off by default): as soon as the phone connects, the iPod
   sends it a *Play* command over AVRCP, so the music starts by itself. It only does this
   once per connection, and not if the phone is already playing.
+- **Lock Screen & Car Controls** (on by default): while streaming, the iPod becomes the
+  system "Now Playing" app, so the phone's track shows on the lock screen, and the car
+  head unit's transport buttons (play/pause, next/previous — including the ones it sends
+  over the USB cable) control the *phone* over Bluetooth instead of the iPod's own Music
+  app. If a head unit or accessory misbehaves, turn this off.
 - **Name** and **Forget Paired Devices**.
 
 ## If it doesn't work

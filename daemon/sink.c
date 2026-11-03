@@ -20,6 +20,7 @@
 #include "btstack_resample.h"
 #include "btstack_ring_buffer.h"
 
+#include "media_controls.h"
 #include "sink.h"
 #include "sink_status.h"
 
@@ -31,9 +32,9 @@
 #define RESAMPLE_OUTPUT_FRAMES         (SBC_MAX_AUDIO_FRAMES_PER_BLOCK + RESAMPLE_ADDITIONAL_FRAMES)
 
 // SBC frames buffered: below MIN stretch, above MAX compress
-#define OPTIMAL_FRAMES_MIN 60
-#define OPTIMAL_FRAMES_MAX 80
-#define ADDITIONAL_FRAMES  30
+#define OPTIMAL_FRAMES_MIN 70
+#define OPTIMAL_FRAMES_MAX 100
+#define ADDITIONAL_FRAMES  40
 
 static btstack_packet_callback_registration_t hci_event_callback_registration;
 
@@ -222,6 +223,49 @@ static int auto_play;
 static int autoplay_done;
 static int autoplay_retries;
 static int remote_playing;             // from AVRCP playback status notifications
+
+// --- media controls / Now Playing (lock screen + car/USB transport buttons) ---
+static int  media_controls_enabled = 1;
+static char cur_title[128];
+static char cur_artist[128];
+
+static int media_is_playing(void){
+    return remote_playing || a2dp_connection.playing;
+}
+
+static void media_apply_active(void){
+    media_controls_set_active(media_controls_enabled && a2dp_connection.connected);
+}
+
+static void media_refresh_metadata(void){
+    if (media_controls_enabled && a2dp_connection.connected){
+        media_controls_set_metadata(cur_title, cur_artist, media_is_playing());
+    }
+}
+
+static void media_refresh_playing(void){
+    if (media_controls_enabled && a2dp_connection.connected){
+        media_controls_set_playing(media_is_playing());
+    }
+}
+
+// remote command from the lock screen / car head unit -> forward to the phone
+static void sink_media_command(media_command_t cmd){
+    uint16_t cid = avrcp_connection.avrcp_cid;
+    if (cid == 0){
+        log_info("media command %d ignored: no AVRCP connection", (int) cmd);
+        return;
+    }
+    switch (cmd){
+        case MEDIA_CMD_PLAY:     avrcp_controller_play(cid); break;
+        case MEDIA_CMD_PAUSE:    avrcp_controller_pause(cid); break;
+        case MEDIA_CMD_TOGGLE:   if (remote_playing) avrcp_controller_pause(cid); else avrcp_controller_play(cid); break;
+        case MEDIA_CMD_NEXT:     avrcp_controller_forward(cid); break;
+        case MEDIA_CMD_PREVIOUS: avrcp_controller_backward(cid); break;
+        case MEDIA_CMD_STOP:     avrcp_controller_stop(cid); break;
+        default: break;
+    }
+}
 static btstack_timer_source_t autoplay_timer;
 
 static void autoplay_timer_handler(btstack_timer_source_t * ts){
@@ -488,9 +532,12 @@ static void a2dp_sink_packet_handler(uint8_t packet_type, uint16_t channel, uint
             reconnect_blocked = 0;
             reconnect_attempts = 0;
             remember_device(address, NULL);
+            cur_title[0] = 0;
+            cur_artist[0] = 0;
             sink_status_set_state(SINK_STATE_CONNECTED);
             sink_status_set_remote(bd_addr_to_str(address), "");
             gap_remote_name_request(address, 0x01, 0);
+            media_apply_active();
             break;
 
         case A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_SBC_CONFIGURATION: {
@@ -529,12 +576,14 @@ static void a2dp_sink_packet_handler(uint8_t packet_type, uint16_t channel, uint
             if (sbc->reconfigure) media_processing_close();
             media_processing_init(sbc);   // audio starts once enough frames are buffered
             sink_status_set_state(SINK_STATE_PLAYING);
+            media_refresh_playing();
             break;
 
         case A2DP_SUBEVENT_STREAM_SUSPENDED:
             a2dp_connection.playing = 0;
             media_processing_pause();
             sink_status_set_state(SINK_STATE_CONNECTED);
+            media_refresh_playing();
             break;
 
         case A2DP_SUBEVENT_STREAM_RELEASED:
@@ -550,6 +599,9 @@ static void a2dp_sink_packet_handler(uint8_t packet_type, uint16_t channel, uint
             a2dp_connection.playing = 0;
             btstack_run_loop_remove_timer(&avrcp_connect_timer);
             media_processing_close();
+            cur_title[0] = 0;
+            cur_artist[0] = 0;
+            media_apply_active();
             sink_status_set_state(SINK_STATE_READY);
             break;
 
@@ -609,16 +661,21 @@ static void avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channe
             break;
         case AVRCP_SUBEVENT_NOTIFICATION_PLAYBACK_STATUS_CHANGED:
             remote_playing = avrcp_subevent_notification_playback_status_changed_get_play_status(packet) == AVRCP_PLAYBACK_STATUS_PLAYING;
+            media_refresh_playing();
             break;
         case AVRCP_SUBEVENT_NOW_PLAYING_TITLE_INFO:
             copy_avrcp_value(value, sizeof(value), avrcp_subevent_now_playing_title_info_get_value(packet),
                              avrcp_subevent_now_playing_title_info_get_value_len(packet));
             sink_status_set_track(value, NULL);
+            btstack_strcpy(cur_title, sizeof(cur_title), value);
+            media_refresh_metadata();
             break;
         case AVRCP_SUBEVENT_NOW_PLAYING_ARTIST_INFO:
             copy_avrcp_value(value, sizeof(value), avrcp_subevent_now_playing_artist_info_get_value(packet),
                              avrcp_subevent_now_playing_artist_info_get_value_len(packet));
             sink_status_set_track(NULL, value);
+            btstack_strcpy(cur_artist, sizeof(cur_artist), value);
+            media_refresh_metadata();
             break;
         default:
             break;
@@ -699,11 +756,15 @@ void sink_setup(const char * local_name, const btstack_audio_sink_t * audio){
     gap_discoverable_control(1);
     gap_set_class_of_device(0x240414);   // Audio/Rendering service, Audio/Video major, Loudspeaker minor
     gap_ssp_set_io_capability(SSP_IO_CAPABILITY_NO_INPUT_NO_OUTPUT);
-    gap_set_default_link_policy_settings(LM_LINK_POLICY_ENABLE_ROLE_SWITCH | LM_LINK_POLICY_ENABLE_SNIFF_MODE);
+    // role switch allowed, but no sniff mode: sniff on the ACL link is a common source
+    // of periodic small audio dropouts while streaming
+    gap_set_default_link_policy_settings(LM_LINK_POLICY_ENABLE_ROLE_SWITCH);
     gap_set_allow_role_switch(true);
 
     hci_event_callback_registration.callback = &hci_packet_handler;
     hci_add_event_handler(&hci_event_callback_registration);
+
+    media_controls_init(&sink_media_command);
 }
 
 void sink_reconnect_last_device(void){
@@ -721,6 +782,11 @@ void sink_set_auto_reconnect(int enabled){
     log_info("reconnect: auto reconnect %s", enabled ? "on" : "off");
     reconnect_attempts = 0;
     schedule_reconnect(RECONNECT_FIRST_DELAY_MS);   // clears status if now off
+}
+
+void sink_set_media_controls(int enabled){
+    media_controls_enabled = enabled ? 1 : 0;
+    media_apply_active();
 }
 
 void sink_set_auto_play(int enabled){
@@ -743,5 +809,6 @@ void sink_disconnect(void){
 }
 
 void sink_shutdown_audio(void){
+    media_controls_set_active(0);
     media_processing_close();
 }

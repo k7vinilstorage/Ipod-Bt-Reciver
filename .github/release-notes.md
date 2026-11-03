@@ -2,6 +2,11 @@ Bluetooth audio receiver (A2DP sink) for a **jailbroken iPod touch 5** (iOS 6 â€
 
 ### Install
 
+**Easiest â€” Cydia repo:** add `https://k7vinilstorage.github.io/Ipod-Bt-Reciver/` as a
+Cydia source and install *BT Receiver (A2DP Sink)*.
+
+**Or install the .deb directly:**
+
 1. Download the `.deb` below.
 2. Copy it to the iPod and install it as root:
    ```

@@ -36,7 +36,7 @@ BTSTACK_SOURCES = \
 	src/classic/sdp_client.c \
 	src/classic/sdp_server.c \
 	src/classic/sdp_util.c \
-	platform/posix/btstack_run_loop_posix.c \
+	platform/corefoundation/btstack_run_loop_corefoundation.m \
 	platform/posix/btstack_tlv_posix.c \
 	platform/posix/hci_dump_posix_fs.c \
 	platform/posix/hci_dump_posix_stdout.c \
@@ -63,6 +63,6 @@ BTSTACK_SOURCES = \
 	3rd-party/bluedroid/encoder/srce/sbc_encoder.c \
 	3rd-party/bluedroid/encoder/srce/sbc_packing.c
 
-BTSTACK_INCLUDES = src src/classic platform/posix 3rd-party/bluedroid/decoder/include 3rd-party/bluedroid/encoder/include 3rd-party/micro-ecc 3rd-party/yxml
+BTSTACK_INCLUDES = src src/classic platform/posix platform/corefoundation 3rd-party/bluedroid/decoder/include 3rd-party/bluedroid/encoder/include 3rd-party/micro-ecc 3rd-party/yxml
 
-DAEMON_SOURCES = main.c sink.c sink_status.c btstack_audio_ios.c btstack_control_ipod.c hci_transport_h4_ipod.c
+DAEMON_SOURCES = main.c sink.c sink_status.c btstack_audio_ios.c btstack_control_ipod.c hci_transport_h4_ipod.c media_controls.m

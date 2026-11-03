@@ -15,7 +15,7 @@
 
 enum { SectionReceiver, SectionStatus, SectionSettings, SectionCount };
 enum { StatusRowState, StatusRowDevice, StatusRowTrack, StatusRowCodec, StatusRowAddress, StatusRowCount };
-enum { SettingsRowName, SettingsRowCharging, SettingsRowReconnect, SettingsRowAutoPlay, SettingsRowForget, SettingsRowCount };
+enum { SettingsRowName, SettingsRowCharging, SettingsRowReconnect, SettingsRowAutoPlay, SettingsRowMediaControls, SettingsRowForget, SettingsRowCount };
 enum { AlertRename = 1, AlertForget = 2 };
 
 @interface RootViewController () <UIAlertViewDelegate>
@@ -23,6 +23,7 @@ enum { AlertRename = 1, AlertForget = 2 };
 @property (nonatomic, strong) UISwitch * chargingSwitch;
 @property (nonatomic, strong) UISwitch * reconnectSwitch;
 @property (nonatomic, strong) UISwitch * autoPlaySwitch;
+@property (nonatomic, strong) UISwitch * mediaControlsSwitch;
 @property (nonatomic, strong) NSDictionary * status;
 @property (nonatomic, strong) NSTimer * timer;
 @property (nonatomic, strong) NSDate * enabledAt;
@@ -45,6 +46,8 @@ enum { AlertRename = 1, AlertForget = 2 };
     [self.reconnectSwitch addTarget:self action:@selector(settingSwitchChanged:) forControlEvents:UIControlEventValueChanged];
     self.autoPlaySwitch = [[UISwitch alloc] init];
     [self.autoPlaySwitch addTarget:self action:@selector(settingSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+    self.mediaControlsSwitch = [[UISwitch alloc] init];
+    [self.mediaControlsSwitch addTarget:self action:@selector(settingSwitchChanged:) forControlEvents:UIControlEventValueChanged];
     [[NSFileManager defaultManager] createDirectoryAtPath:SINK_DATA_DIR withIntermediateDirectories:YES attributes:nil error:NULL];
     [self refresh];
 }
@@ -120,7 +123,7 @@ enum { AlertRename = 1, AlertForget = 2 };
 // settings file: key=value lines, read by the daemon every second
 - (NSDictionary *)readSettings {
     NSString * text = [NSString stringWithContentsOfFile:SINK_SETTINGS_FILE encoding:NSUTF8StringEncoding error:NULL];
-    NSMutableDictionary * result = [NSMutableDictionary dictionaryWithDictionary:@{ @"only_when_charging": @"0", @"auto_reconnect": @"1", @"auto_play": @"0" }];
+    NSMutableDictionary * result = [NSMutableDictionary dictionaryWithDictionary:@{ @"only_when_charging": @"0", @"auto_reconnect": @"1", @"auto_play": @"0", @"media_controls": @"1" }];
     for (NSString * line in [text componentsSeparatedByString:@"\n"]) {
         NSRange eq = [line rangeOfString:@"="];
         if (eq.location == NSNotFound) continue;
@@ -141,9 +144,13 @@ enum { AlertRename = 1, AlertForget = 2 };
     return [[self readSettings][@"auto_play"] intValue] != 0;
 }
 
+- (BOOL)mediaControls {
+    return [[self readSettings][@"media_controls"] intValue] != 0;
+}
+
 - (void)writeSettings {
-    NSString * text = [NSString stringWithFormat:@"only_when_charging=%d\nauto_reconnect=%d\nauto_play=%d\n",
-                       self.chargingSwitch.on ? 1 : 0, self.reconnectSwitch.on ? 1 : 0, self.autoPlaySwitch.on ? 1 : 0];
+    NSString * text = [NSString stringWithFormat:@"only_when_charging=%d\nauto_reconnect=%d\nauto_play=%d\nmedia_controls=%d\n",
+                       self.chargingSwitch.on ? 1 : 0, self.reconnectSwitch.on ? 1 : 0, self.autoPlaySwitch.on ? 1 : 0, self.mediaControlsSwitch.on ? 1 : 0];
     [text writeToFile:SINK_SETTINGS_FILE atomically:YES encoding:NSUTF8StringEncoding error:NULL];
 }
 
@@ -155,6 +162,7 @@ enum { AlertRename = 1, AlertForget = 2 };
     if (!self.chargingSwitch.isTracking)  [self.chargingSwitch setOn:[self onlyWhenCharging] animated:NO];
     if (!self.reconnectSwitch.isTracking) [self.reconnectSwitch setOn:[self autoReconnect] animated:NO];
     if (!self.autoPlaySwitch.isTracking)  [self.autoPlaySwitch setOn:[self autoPlay] animated:NO];
+    if (!self.mediaControlsSwitch.isTracking) [self.mediaControlsSwitch setOn:[self mediaControls] animated:NO];
     [self.tableView reloadData];
 }
 
@@ -246,7 +254,7 @@ enum { AlertRename = 1, AlertForget = 2 };
                 [self configuredName]];
     }
     if (section == SectionSettings) {
-        return @"Only While Charging: the receiver turns on when the iPod is connected to power (charger, computer or dock) and hands Bluetooth back to iOS 5 seconds after it is unplugged.\n\nReconnect Automatically: connects back to the last phone when the receiver starts and after the connection was lost.\n\nAuto Play on Connect: tells the phone to start playing as soon as it connects (if it isn't playing already).";
+        return @"Only While Charging: the receiver turns on when the iPod is connected to power (charger, computer or dock) and hands Bluetooth back to iOS 5 seconds after it is unplugged.\n\nReconnect Automatically: connects back to the last phone when the receiver starts and after the connection was lost.\n\nAuto Play on Connect: tells the phone to start playing as soon as it connects (if it isn't playing already).\n\nLock Screen & Car Controls: shows the track on the lock screen and lets the car head unit's play/pause and next/previous buttons control the phone over Bluetooth, instead of the iPod's own Music app.";
     }
     return nil;
 }
@@ -313,6 +321,10 @@ enum { AlertRename = 1, AlertForget = 2 };
         } else if (indexPath.row == SettingsRowAutoPlay) {
             cell.textLabel.text = @"Auto Play on Connect";
             cell.accessoryView = self.autoPlaySwitch;
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        } else if (indexPath.row == SettingsRowMediaControls) {
+            cell.textLabel.text = @"Lock Screen & Car Controls";
+            cell.accessoryView = self.mediaControlsSwitch;
             cell.selectionStyle = UITableViewCellSelectionStyleNone;
         } else {
             cell.textLabel.text = @"Forget Paired Devices";

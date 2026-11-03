@@ -30,7 +30,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 
 #include "btstack.h"
-#include "btstack_run_loop_posix.h"
+#include "btstack_run_loop_corefoundation.h"
 #include "btstack_tlv_posix.h"
 #include "classic/btstack_link_key_db_tlv.h"
 #include "hci_dump_posix_fs.h"
@@ -91,6 +91,7 @@ static char local_name[64] = SINK_DEFAULT_NAME;
 static int setting_only_when_charging;
 static int setting_auto_reconnect = 1;
 static int setting_auto_play;
+static int setting_media_controls = 1;   // lock screen + car/USB buttons, on by default
 
 // --- helpers ---
 
@@ -98,6 +99,7 @@ static void load_settings(void){
     setting_only_when_charging = 0;
     setting_auto_reconnect = 1;
     setting_auto_play = 0;
+    setting_media_controls = 1;
     FILE * f = fopen(SINK_SETTINGS_FILE, "r");
     if (!f) return;
     char line[64];
@@ -106,6 +108,7 @@ static void load_settings(void){
         if (sscanf(line, "only_when_charging=%d", &value) == 1) setting_only_when_charging = value != 0;
         if (sscanf(line, "auto_reconnect=%d", &value) == 1)     setting_auto_reconnect = value != 0;
         if (sscanf(line, "auto_play=%d", &value) == 1)          setting_auto_play = value != 0;
+        if (sscanf(line, "media_controls=%d", &value) == 1)     setting_media_controls = value != 0;
     }
     fclose(f);
 }
@@ -249,6 +252,7 @@ static void start_bluetooth(void){
     sink_setup(local_name, btstack_audio_ios_sink_get_instance());
     sink_set_auto_reconnect(setting_auto_reconnect);
     sink_set_auto_play(setting_auto_play);
+    sink_set_media_controls(setting_media_controls);
 
     btstack_run_loop_set_timer_handler(&startup_timer, &startup_timeout_handler);
     btstack_run_loop_set_timer(&startup_timer, STARTUP_TIMEOUT_MS);
@@ -291,6 +295,7 @@ static void evaluate(void){
 
     sink_set_auto_reconnect(setting_auto_reconnect);
     sink_set_auto_play(setting_auto_play);
+    sink_set_media_controls(setting_media_controls);
 
     if (hci_working && access(SINK_FORGET_FLAG, F_OK) == 0){
         log_info("a2dpsinkd: forgetting all paired devices");
@@ -383,7 +388,7 @@ int main(int argc, const char * argv[]){
     sink_status_set_state(SINK_STATE_STARTING);
 
     btstack_memory_init();
-    btstack_run_loop_init(btstack_run_loop_posix_get_instance());
+    btstack_run_loop_init(btstack_run_loop_corefoundation_get_instance());
 
     if (hci_dump){
         hci_dump_posix_fs_open(HCI_DUMP_PATH, HCI_DUMP_PACKETLOGGER);
