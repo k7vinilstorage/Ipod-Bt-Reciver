@@ -11,6 +11,7 @@
 #define SINK_LAST_DEVICE   SINK_DATA_DIR @"/last_device"
 #define SINK_LINK_KEY_DB   SINK_DATA_DIR @"/pairings.tlv"
 #define SINK_SETTINGS_FILE SINK_DATA_DIR @"/settings"
+#define SINK_MEDIA_GUARD   SINK_DATA_DIR @"/media_guard"
 #define SINK_DEFAULT_NAME  @"iPod Receiver"
 
 enum { SectionReceiver, SectionStatus, SectionSettings, SectionCount };
@@ -181,6 +182,10 @@ enum { AlertRename = 1, AlertForget = 2 };
 }
 
 - (void)settingSwitchChanged:(UISwitch *)sender {
+    if (sender == self.mediaControlsSwitch) {
+        // let the daemon retry media controls after an automatic shut-off
+        [[NSFileManager defaultManager] removeItemAtPath:SINK_MEDIA_GUARD error:NULL];
+    }
     [self writeSettings];
     [self refresh];
 }
@@ -254,7 +259,14 @@ enum { AlertRename = 1, AlertForget = 2 };
                 [self configuredName]];
     }
     if (section == SectionSettings) {
-        return @"Only While Charging: the receiver turns on when the iPod is connected to power (charger, computer or dock) and hands Bluetooth back to iOS 5 seconds after it is unplugged.\n\nReconnect Automatically: connects back to the last phone when the receiver starts and after the connection was lost.\n\nAuto Play on Connect: tells the phone to start playing as soon as it connects (if it isn't playing already).\n\nLock Screen & Car Controls: shows the track on the lock screen and lets the car head unit's play/pause and next/previous buttons control the phone over Bluetooth, instead of the iPod's own Music app.";
+        NSString * media = self.status[@"media"];
+        NSString * note = @"";
+        if ([media isEqualToString:@"failed"]) {
+            note = @"\u26A0\uFE0F Lock Screen & Car Controls crashed on this iPod and were turned off automatically; the receiver itself keeps working. Switch them off and on to try again.\n\n";
+        } else if ([media isEqualToString:@"unavailable"]) {
+            note = @"\u26A0\uFE0F Lock Screen & Car Controls aren't available on this iOS version; the receiver itself keeps working.\n\n";
+        }
+        return [note stringByAppendingString:@"Only While Charging: the receiver turns on when the iPod is connected to power (charger, computer or dock) and hands Bluetooth back to iOS 5 seconds after it is unplugged.\n\nReconnect Automatically: connects back to the last phone when the receiver starts and after the connection was lost.\n\nAuto Play on Connect: tells the phone to start playing as soon as it connects (if it isn't playing already).\n\nLock Screen & Car Controls: shows the track on the lock screen and lets the car head unit's play/pause and next/previous buttons control the phone over Bluetooth, instead of the iPod's own Music app."];
     }
     return nil;
 }

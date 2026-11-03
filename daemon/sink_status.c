@@ -19,6 +19,7 @@ static char codec[64];
 static char title[128];
 static char artist[128];
 static char reconnecting[64];
+static char media[16];
 
 static void copy_clean(char * dst, size_t size, const char * src){
     size_t i = 0;
@@ -45,6 +46,7 @@ void sink_status_flush(void){
     fprintf(f, "title=%s\n", title);
     fprintf(f, "artist=%s\n", artist);
     fprintf(f, "reconnecting=%s\n", reconnecting);
+    fprintf(f, "media=%s\n", media);
     fprintf(f, "error=%s\n", error_message);
     fclose(f);
     chmod(tmp_path, 0644);
@@ -97,4 +99,11 @@ void sink_status_set_track(const char * new_title, const char * new_artist){
 void sink_status_set_reconnecting(const char * device){
     copy_clean(reconnecting, sizeof(reconnecting), device);
     sink_status_flush();
+}
+
+void sink_status_set_media(const char * state){
+    char previous[sizeof(media)];
+    memcpy(previous, media, sizeof(media));
+    copy_clean(media, sizeof(media), state);
+    if (strcmp(previous, media) != 0) sink_status_flush();
 }

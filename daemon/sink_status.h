@@ -9,6 +9,7 @@
 #define SINK_STATUS_FILE   SINK_DATA_DIR "/status"       // written by daemon, key=value lines
 #define SINK_LAST_DEVICE   SINK_DATA_DIR "/last_device"  // BD_ADDR of last connected phone
 #define SINK_LINK_KEY_DB   SINK_DATA_DIR "/pairings.tlv"
+#define SINK_MEDIA_GUARD   SINK_DATA_DIR "/media_guard"  // exists -> media controls crashed last time
 #define SINK_SETTINGS_FILE SINK_DATA_DIR "/settings"     // app writes: only_when_charging, auto_reconnect, auto_play, media_controls (all 0/1)
 
 #define SINK_DEFAULT_NAME  "iPod Receiver"
@@ -32,6 +33,8 @@ void sink_status_set_codec(const char * description);
 void sink_status_set_track(const char * title, const char * artist);
 // device we are trying to reconnect to, NULL/"" when not reconnecting
 void sink_status_set_reconnecting(const char * device);
+// media controls: "off", "ready", "active", "unavailable" or "failed"
+void sink_status_set_media(const char * state);
 
 // write the status file now (otherwise written by the setters)
 void sink_status_flush(void);

@@ -87,7 +87,7 @@ Then, inside this folder:
 make package FINALPACKAGE=1
 ```
 
-This produces `packages/local.a2dpsink_0.4.0_iphoneos-arm.deb`.
+This produces `packages/local.a2dpsink_0.4.1_iphoneos-arm.deb`.
 
 ## Install
 
@@ -127,7 +127,9 @@ kept awake. The screen can turn off, but the device won't sleep, so keep it plug
   system "Now Playing" app, so the phone's track shows on the lock screen, and the car
   head unit's transport buttons (play/pause, next/previous — including the ones it sends
   over the USB cable) control the *phone* over Bluetooth instead of the iPod's own Music
-  app. If a head unit or accessory misbehaves, turn this off.
+  app. If a head unit or accessory misbehaves, turn this off. This part is isolated
+  from the receiver: if it can't start on your iPod (or crashes), it switches itself
+  off, the app shows a warning, and Bluetooth audio keeps working.
 - **Name** and **Forget Paired Devices**.
 
 ## If it doesn't work
@@ -166,11 +168,12 @@ launchctl load /System/Library/LaunchDaemons/com.apple.BTServer.plist
 | `daemon/sink.c` | A2DP sink, AVRCP, SBC decode, clock-drift resampling (from BTstack's `a2dp_sink_demo.c`) |
 | `daemon/btstack_control_ipod.c` | Stops/starts Apple's Bluetooth, configures the chip with BlueTool |
 | `daemon/hci_transport_h4_ipod.c` | H4 over the netgraph UART socket |
+| `daemon/media_controls.m` | Now Playing / lock screen and car-button forwarding (MediaPlayer loaded at runtime) |
 | `daemon/btstack_audio_ios.c` | AudioQueue output (lock-free hand-off between threads) |
 | `daemon/ios9_compat.h` | `clock_gettime` replacement (it only exists on iOS 10+) |
 | `app/` | The BT Receiver settings app |
 | `layout/` | LaunchDaemon plist, Debian install scripts |
-| `stubs/` | iOS 9.3 library stubs for armv7-only functions missing from the 10.3 SDK (`__divsi3`, `objc_msgSend_stret`, …) |
+| `stubs/` | iOS 9.3 library stubs for armv7-only functions missing from the 10.3 SDK (`__divsi3`, `objc_msgSend_stret`, `_Unwind_SjLj_*`, …) |
 
 ## License
 

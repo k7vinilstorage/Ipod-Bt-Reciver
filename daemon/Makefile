@@ -10,10 +10,12 @@ TOOL_NAME = a2dpsinkd
 a2dpsinkd_FILES = $(DAEMON_SOURCES) $(addprefix $(BTSTACK_ROOT)/,$(BTSTACK_SOURCES))
 a2dpsinkd_CFLAGS = -I. -include ios9_compat.h $(addprefix -I$(BTSTACK_ROOT)/,$(BTSTACK_INCLUDES)) \
 	-Wno-unused-parameter -Wno-sign-compare -Wno-missing-field-initializers -Wno-deprecated-declarations -Wno-error
-# armv7 has no hardware divide: link the iOS 9.3 compiler_rt stub (the 10.3 SDK one lacks the armv7 helpers)
-a2dpsinkd_LDFLAGS = ../stubs/libcompiler_rt.tbd
-a2dpsinkd_FRAMEWORKS = CoreFoundation Foundation AudioToolbox MediaPlayer IOKit
-a2dpsinkd_PRIVATE_FRAMEWORKS = MediaRemote
+# iOS 9.3 stubs for armv7-only helpers the 10.3 SDK stubs lack:
+#  libcompiler_rt: integer division (armv7 has no hardware divide)
+#  libunwind:      setjmp/longjmp exception helpers used by @try/@catch on armv7
+a2dpsinkd_LDFLAGS = ../stubs/libcompiler_rt.tbd ../stubs/libunwind.tbd
+# MediaPlayer / MediaRemote are loaded at runtime (dlopen), see media_controls.m
+a2dpsinkd_FRAMEWORKS = CoreFoundation Foundation AudioToolbox IOKit
 a2dpsinkd_INSTALL_PATH = /usr/libexec
 
 include $(THEOS_MAKE_PATH)/tool.mk

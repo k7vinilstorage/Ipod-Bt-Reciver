@@ -30,7 +30,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 
 #include "btstack.h"
-#include "btstack_run_loop_corefoundation.h"
+#include "btstack_run_loop_posix.h"
 #include "btstack_tlv_posix.h"
 #include "classic/btstack_link_key_db_tlv.h"
 #include "hci_dump_posix_fs.h"
@@ -211,6 +211,7 @@ static void hci_event_handler(uint8_t packet_type, uint16_t channel, uint8_t * p
                     sink_status_set_local_addr(bd_addr_to_str(addr));
                     sink_status_set_state(SINK_STATE_READY);
                     sink_reconnect_last_device();
+                    sink_media_prepare();    // lock screen / car controls (isolated, may be unavailable)
                     break;
                 }
                 case HCI_STATE_OFF:
@@ -388,7 +389,7 @@ int main(int argc, const char * argv[]){
     sink_status_set_state(SINK_STATE_STARTING);
 
     btstack_memory_init();
-    btstack_run_loop_init(btstack_run_loop_corefoundation_get_instance());
+    btstack_run_loop_init(btstack_run_loop_posix_get_instance());
 
     if (hci_dump){
         hci_dump_posix_fs_open(HCI_DUMP_PATH, HCI_DUMP_PACKETLOGGER);

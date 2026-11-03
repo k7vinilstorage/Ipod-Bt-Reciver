@@ -15,6 +15,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "btstack.h"
 #include "btstack_resample.h"
@@ -225,7 +226,18 @@ static int autoplay_retries;
 static int remote_playing;             // from AVRCP playback status notifications
 
 // --- media controls / Now Playing (lock screen + car/USB transport buttons) ---
+//
+// Experimental and isolated: MediaPlayer is only touched after Bluetooth is up, and a
+// guard file is written around each risky first call. If the daemon dies there, the
+// next start finds the guard and leaves media controls off, so the receiver still
+// works (the app shows it and can retry by toggling the setting).
+
+static void sink_media_command(media_command_t cmd);
+
 static int  media_controls_enabled = 1;
+static int  media_hci_ready;          // Bluetooth is up, safe to start media controls
+static int  media_state;              // 0 = not started, 1 = ready, -1 = unavailable / failed
+static int  media_activated_once;
 static char cur_title[128];
 static char cur_artist[128];
 
@@ -233,18 +245,62 @@ static int media_is_playing(void){
     return remote_playing || a2dp_connection.playing;
 }
 
+static void media_guard_set(const char * phase){
+    FILE * f = fopen(SINK_MEDIA_GUARD, "w");
+    if (!f) return;
+    fprintf(f, "%s\n", phase);
+    fclose(f);   // in the kernel now: survives the process crashing
+}
+
+static void media_guard_clear(void){
+    unlink(SINK_MEDIA_GUARD);
+}
+
+static int media_ensure_ready(void){
+    if (media_state) return media_state > 0;
+    if (access(SINK_MEDIA_GUARD, F_OK) == 0){
+        log_error("media controls: the last start crashed in media code, keeping them off");
+        media_state = -1;
+        sink_status_set_media("failed");
+        return 0;
+    }
+    media_guard_set("init");
+    int ok = media_controls_init(&sink_media_command);
+    media_guard_clear();
+    media_state = ok ? 1 : -1;
+    sink_status_set_media(ok ? "ready" : "unavailable");
+    return ok;
+}
+
 static void media_apply_active(void){
-    media_controls_set_active(media_controls_enabled && a2dp_connection.connected);
+    if (!media_hci_ready) return;
+    if (!media_controls_enabled){
+        if (media_state > 0) media_controls_set_active(0);
+        sink_status_set_media("off");
+        return;
+    }
+    if (!media_ensure_ready()) return;
+    int want = a2dp_connection.connected;
+    if (want && !media_activated_once){
+        media_guard_set("activate");
+        media_controls_set_active(1);
+        media_controls_set_metadata(cur_title, cur_artist, media_is_playing());
+        media_guard_clear();
+        media_activated_once = 1;
+    } else {
+        media_controls_set_active(want);
+    }
+    sink_status_set_media(want ? "active" : "ready");
 }
 
 static void media_refresh_metadata(void){
-    if (media_controls_enabled && a2dp_connection.connected){
+    if (media_state > 0 && media_controls_enabled && a2dp_connection.connected){
         media_controls_set_metadata(cur_title, cur_artist, media_is_playing());
     }
 }
 
 static void media_refresh_playing(void){
-    if (media_controls_enabled && a2dp_connection.connected){
+    if (media_state > 0 && media_controls_enabled && a2dp_connection.connected){
         media_controls_set_playing(media_is_playing());
     }
 }
@@ -763,8 +819,6 @@ void sink_setup(const char * local_name, const btstack_audio_sink_t * audio){
 
     hci_event_callback_registration.callback = &hci_packet_handler;
     hci_add_event_handler(&hci_event_callback_registration);
-
-    media_controls_init(&sink_media_command);
 }
 
 void sink_reconnect_last_device(void){
@@ -785,7 +839,18 @@ void sink_set_auto_reconnect(int enabled){
 }
 
 void sink_set_media_controls(int enabled){
-    media_controls_enabled = enabled ? 1 : 0;
+    enabled = enabled ? 1 : 0;
+    if (enabled == media_controls_enabled) return;
+    media_controls_enabled = enabled;
+    // switched back on after a failure and the app cleared the guard: try again
+    if (enabled && media_state < 0 && access(SINK_MEDIA_GUARD, F_OK) != 0){
+        media_state = 0;
+    }
+    media_apply_active();
+}
+
+void sink_media_prepare(void){
+    media_hci_ready = 1;
     media_apply_active();
 }
 
@@ -809,6 +874,6 @@ void sink_disconnect(void){
 }
 
 void sink_shutdown_audio(void){
-    media_controls_set_active(0);
+    if (media_state > 0) media_controls_set_active(0);
     media_processing_close();
 }
