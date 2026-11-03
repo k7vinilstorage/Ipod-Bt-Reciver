@@ -208,6 +208,50 @@ static void avrcp_connect_timer_handler(btstack_timer_source_t * ts){
     log_info("AVRCP: connecting to %s -> status 0x%02x", bd_addr_to_str(a2dp_connection.addr), status);
 }
 
+// --- auto play ---
+//
+// Once per connection: shortly after AVRCP is up (and A2DP is connected), send "Play"
+// unless the phone is already playing. The delay gives the phone time to report its
+// playback status, so we don't toggle a player that just started by itself.
+
+#define AUTOPLAY_DELAY_MS        2500
+#define AUTOPLAY_RETRY_MS        1000
+#define AUTOPLAY_MAX_RETRIES     10     // wait up to ~10 s for A2DP when AVRCP came first
+
+static int auto_play;
+static int autoplay_done;
+static int autoplay_retries;
+static int remote_playing;             // from AVRCP playback status notifications
+static btstack_timer_source_t autoplay_timer;
+
+static void autoplay_timer_handler(btstack_timer_source_t * ts){
+    if (!auto_play || autoplay_done || !avrcp_connection.avrcp_cid) return;
+    if (!a2dp_connection.connected){
+        if (++autoplay_retries > AUTOPLAY_MAX_RETRIES) return;
+        btstack_run_loop_set_timer(ts, AUTOPLAY_RETRY_MS);
+        btstack_run_loop_add_timer(ts);
+        return;
+    }
+    autoplay_done = 1;
+    if (remote_playing || a2dp_connection.playing){
+        log_info("auto play: phone is already playing");
+        return;
+    }
+    uint8_t status = avrcp_controller_play(avrcp_connection.avrcp_cid);
+    log_info("auto play: sending Play -> status 0x%02x", status);
+}
+
+static void autoplay_start(void){
+    btstack_run_loop_remove_timer(&autoplay_timer);
+    autoplay_done = 0;
+    autoplay_retries = 0;
+    remote_playing = 0;
+    if (!auto_play) return;
+    btstack_run_loop_set_timer_handler(&autoplay_timer, &autoplay_timer_handler);
+    btstack_run_loop_set_timer(&autoplay_timer, AUTOPLAY_DELAY_MS);
+    btstack_run_loop_add_timer(&autoplay_timer);
+}
+
 // --- audio pipeline ---
 
 static void playback_handler(int16_t * buffer, uint16_t num_audio_frames, const btstack_audio_context_t * context){
@@ -530,9 +574,11 @@ static void avrcp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
             avrcp_target_support_event(avrcp_connection.avrcp_cid, AVRCP_NOTIFICATION_EVENT_BATT_STATUS_CHANGED);
             avrcp_target_battery_status_changed(avrcp_connection.avrcp_cid, AVRCP_BATTERY_STATUS_EXTERNAL);
             avrcp_controller_get_supported_events(avrcp_connection.avrcp_cid);
+            autoplay_start();
             break;
         case AVRCP_SUBEVENT_CONNECTION_RELEASED:
             avrcp_connection.avrcp_cid = 0;
+            btstack_run_loop_remove_timer(&autoplay_timer);
             break;
         default:
             break;
@@ -560,6 +606,9 @@ static void avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channe
             break;
         case AVRCP_SUBEVENT_NOTIFICATION_TRACK_CHANGED:
             avrcp_controller_get_now_playing_info(avrcp_connection.avrcp_cid);
+            break;
+        case AVRCP_SUBEVENT_NOTIFICATION_PLAYBACK_STATUS_CHANGED:
+            remote_playing = avrcp_subevent_notification_playback_status_changed_get_play_status(packet) == AVRCP_PLAYBACK_STATUS_PLAYING;
             break;
         case AVRCP_SUBEVENT_NOW_PLAYING_TITLE_INFO:
             copy_avrcp_value(value, sizeof(value), avrcp_subevent_now_playing_title_info_get_value(packet),
@@ -672,6 +721,11 @@ void sink_set_auto_reconnect(int enabled){
     log_info("reconnect: auto reconnect %s", enabled ? "on" : "off");
     reconnect_attempts = 0;
     schedule_reconnect(RECONNECT_FIRST_DELAY_MS);   // clears status if now off
+}
+
+void sink_set_auto_play(int enabled){
+    auto_play = enabled ? 1 : 0;
+    if (!auto_play) btstack_run_loop_remove_timer(&autoplay_timer);
 }
 
 void sink_forget_last_device(void){

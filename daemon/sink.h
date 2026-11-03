@@ -12,6 +12,7 @@ void sink_reconnect_last_device(void);
 
 void sink_set_auto_reconnect(int enabled);   // default on
 void sink_forget_last_device(void);         // after deleting pairings
+void sink_set_auto_play(int enabled);       // send AVRCP Play once after connecting (default off)
 
 void sink_disconnect(void);
 void sink_shutdown_audio(void);

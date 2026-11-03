@@ -81,7 +81,7 @@ Then, inside this folder:
 make package FINALPACKAGE=1
 ```
 
-This produces `packages/local.a2dpsink_0.2.0_iphoneos-arm.deb`.
+This produces `packages/local.a2dpsink_0.3.0_iphoneos-arm.deb`.
 
 ## Install
 
@@ -114,6 +114,9 @@ kept awake. The screen can turn off, but the device won't sleep, so keep it plug
   back to the last phone. It retries every 10 s for 2 minutes, then every 60 s. It doesn't
   reconnect if you disconnected from the phone on purpose; connect from the phone and it
   starts working again. The app shows *Reconnecting to …* while it tries.
+- **Auto Play on Connect** (off by default): as soon as the phone connects, the iPod
+  sends it a *Play* command over AVRCP, so the music starts by itself. It only does this
+  once per connection, and not if the phone is already playing.
 - **Name** and **Forget Paired Devices**.
 
 ## If it doesn't work

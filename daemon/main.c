@@ -90,12 +90,14 @@ static char local_name[64] = SINK_DEFAULT_NAME;
 // settings (written by the app)
 static int setting_only_when_charging;
 static int setting_auto_reconnect = 1;
+static int setting_auto_play;
 
 // --- helpers ---
 
 static void load_settings(void){
     setting_only_when_charging = 0;
     setting_auto_reconnect = 1;
+    setting_auto_play = 0;
     FILE * f = fopen(SINK_SETTINGS_FILE, "r");
     if (!f) return;
     char line[64];
@@ -103,6 +105,7 @@ static void load_settings(void){
     while (fgets(line, sizeof(line), f)){
         if (sscanf(line, "only_when_charging=%d", &value) == 1) setting_only_when_charging = value != 0;
         if (sscanf(line, "auto_reconnect=%d", &value) == 1)     setting_auto_reconnect = value != 0;
+        if (sscanf(line, "auto_play=%d", &value) == 1)          setting_auto_play = value != 0;
     }
     fclose(f);
 }
@@ -245,6 +248,7 @@ static void start_bluetooth(void){
 
     sink_setup(local_name, btstack_audio_ios_sink_get_instance());
     sink_set_auto_reconnect(setting_auto_reconnect);
+    sink_set_auto_play(setting_auto_play);
 
     btstack_run_loop_set_timer_handler(&startup_timer, &startup_timeout_handler);
     btstack_run_loop_set_timer(&startup_timer, STARTUP_TIMEOUT_MS);
@@ -286,6 +290,7 @@ static void evaluate(void){
     }
 
     sink_set_auto_reconnect(setting_auto_reconnect);
+    sink_set_auto_play(setting_auto_play);
 
     if (hci_working && access(SINK_FORGET_FLAG, F_OK) == 0){
         log_info("a2dpsinkd: forgetting all paired devices");
