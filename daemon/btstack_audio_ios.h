@@ -24,4 +24,13 @@ uint32_t btstack_audio_ios_get_queued_frames(void);
 // Number of times the AudioQueue ran dry since the stream started.
 uint32_t btstack_audio_ios_get_underruns(void);
 
+// Another app (typically the Music app, started by a car head unit) interrupted our audio
+// session. The driver takes the audio back on the BTstack thread: before_reclaim runs first
+// (e.g. pause the Music app), after_reclaim once our queue plays again (e.g. re-assert
+// Now Playing). Either may be NULL.
+void     btstack_audio_ios_set_reclaim_handlers(void (*before_reclaim)(void), void (*after_reclaim)(void));
+
+// Number of times the audio was taken back from another app since the stream started.
+uint32_t btstack_audio_ios_get_reclaims(void);
+
 #endif

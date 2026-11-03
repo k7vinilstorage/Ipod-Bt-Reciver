@@ -87,7 +87,7 @@ Then, inside this folder:
 make package FINALPACKAGE=1
 ```
 
-This produces `packages/local.a2dpsink_0.4.2_iphoneos-arm.deb`.
+This produces `packages/local.a2dpsink_0.4.3_iphoneos-arm.deb`.
 
 ## Install
 
@@ -130,6 +130,12 @@ kept awake. The screen can turn off, but the device won't sleep, so keep it plug
   app. If a head unit or accessory misbehaves, turn this off. This part is isolated
   from the receiver: if it can't start on your iPod (or crashes), it switches itself
   off, the app shows a warning, and Bluetooth audio keeps working.
+
+  Many head units tell the iPod's own **Music app** to play after a track change, which
+  used to stop the receiver. Now the receiver notices when another app takes the audio,
+  pauses the Music app and takes the audio back within about a quarter of a second
+  (`audio: took the audio back` in the log). If your head unit keeps restarting Music
+  anyway, removing the songs from the iPod's Music library stops it for good.
 - **Name** and **Forget Paired Devices**.
 
 ## Audio quality tips

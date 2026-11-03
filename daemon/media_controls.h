@@ -33,4 +33,11 @@ void media_controls_set_active(int active);
 void media_controls_set_metadata(const char * title, const char * artist, int playing);
 void media_controls_set_playing(int playing);
 
+// Re-publish the current Now Playing info (after taking the audio back from another app).
+void media_controls_refresh(void);
+
+// Pause the built-in Music app's player if it is playing (MPMusicPlayerController, so this
+// can never pause us). Returns 1 if it was playing. Loads MediaPlayer itself if needed.
+int  media_controls_pause_system_music(void);
+
 #endif

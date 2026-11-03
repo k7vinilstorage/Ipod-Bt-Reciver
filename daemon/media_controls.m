@@ -45,6 +45,11 @@
 - (void)setNowPlayingInfo:(NSDictionary *)info;
 @end
 
+@protocol A2DPMusicPlayer <NSObject>
+- (NSInteger)playbackState;   // MPMusicPlaybackState
+- (void)pause;
+@end
+
 typedef void (*mr_set_can_be_now_playing_t)(Boolean);
 
 // commands forwarded to the phone, in media_command_t order
@@ -265,4 +270,37 @@ void media_controls_set_playing(int playing){
     if (playing == g_playing) return;
     g_playing = playing;
     publish();
+}
+
+void media_controls_refresh(void){
+    publish();
+}
+
+int media_controls_pause_system_music(void){
+    static void * mp;
+    if (!mp) mp = dlopen(MEDIAPLAYER_PATH, RTLD_LAZY | RTLD_GLOBAL);
+    if (!mp) return 0;
+    Class player_class = objc_getClass("MPMusicPlayerController");
+    if (!player_class) return 0;
+
+    int paused = 0;
+    @try {
+        @autoreleasepool {
+            id player = send_id((id) player_class, "systemMusicPlayer");     // iOS 8+
+            if (!player) player = send_id((id) player_class, "iPodMusicPlayer");
+            if (player && [player respondsToSelector:@selector(playbackState)]
+                       && [player respondsToSelector:@selector(pause)]){
+                NSInteger state = [(id<A2DPMusicPlayer>) player playbackState];
+                // 0 stopped, 1 playing, 2 paused, 3 interrupted, 4/5 seeking
+                if (state != 0 && state != 2){
+                    [(id<A2DPMusicPlayer>) player pause];
+                    paused = 1;
+                }
+                log_info("media_controls: Music app state %d%s", (int) state, paused ? ", paused it" : "");
+            }
+        }
+    } @catch (NSException * e){
+        log_exception("pause Music", e);
+    }
+    return paused;
 }

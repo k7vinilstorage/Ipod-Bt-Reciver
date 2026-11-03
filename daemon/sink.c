@@ -67,6 +67,7 @@ static int32_t      total_avg;              // smoothed total buffered frames
 static uint32_t     stat_dropped_sbc;
 static uint32_t     stat_trims;
 static uint32_t     stat_underruns_seen;
+static uint32_t     stat_reclaims_seen;
 static unsigned int stat_ticks;
 static btstack_timer_source_t stats_timer;
 
@@ -315,10 +316,29 @@ static void media_refresh_metadata(void){
     }
 }
 
-static void media_refresh_playing(void){
+// Phones briefly report "not playing" around track changes. Publishing that makes some head
+// units decide the iPod stopped and tell the Music app to play, so only a pause that lasts
+// is published; "playing" goes out immediately.
+#define NOT_PLAYING_DEBOUNCE_MS 1500
+static btstack_timer_source_t playing_debounce_timer;
+
+static void playing_debounce_handler(btstack_timer_source_t * ts){
+    UNUSED(ts);
     if (media_state > 0 && media_controls_enabled && a2dp_connection.connected){
         media_controls_set_playing(media_is_playing());
     }
+}
+
+static void media_refresh_playing(void){
+    if (!(media_state > 0 && media_controls_enabled && a2dp_connection.connected)) return;
+    btstack_run_loop_remove_timer(&playing_debounce_timer);
+    if (media_is_playing()){
+        media_controls_set_playing(1);
+        return;
+    }
+    btstack_run_loop_set_timer_handler(&playing_debounce_timer, &playing_debounce_handler);
+    btstack_run_loop_set_timer(&playing_debounce_timer, NOT_PLAYING_DEBOUNCE_MS);
+    btstack_run_loop_add_timer(&playing_debounce_timer);
 }
 
 // remote command from the lock screen / car head unit -> forward to the phone
@@ -452,18 +472,40 @@ static void stats_timer_handler(btstack_timer_source_t * ts){
     if (underruns < stat_underruns_seen) stat_underruns_seen = 0;     // stream restarted
     uint32_t new_underruns = underruns - stat_underruns_seen;
     stat_underruns_seen = underruns;
+    uint32_t reclaims = btstack_audio_ios_get_reclaims();
+    if (reclaims < stat_reclaims_seen) stat_reclaims_seen = 0;
+    uint32_t new_reclaims = reclaims - stat_reclaims_seen;
+    stat_reclaims_seen = reclaims;
     stat_ticks++;
-    int problems = new_underruns || stat_dropped_sbc || stat_trims;
+    int problems = new_underruns || stat_dropped_sbc || stat_trims || new_reclaims;
     if (audio_stream_started && (problems || stat_ticks % STATS_HEALTH_TICKS == 0)){
         int32_t total = (int32_t) (sink_pcm_frames_available() + btstack_audio_ios_get_queued_frames());
-        log_info("audio: %s last %u s: %u dropouts, %u SBC frames dropped, %u skips; buffered %u ms",
+        log_info("audio: %s last %u s: %u dropouts, %u SBC frames dropped, %u skips, %u taken back from other apps; buffered %u ms",
                  problems ? "PROBLEMS" : "ok,", STATS_INTERVAL_MS / 1000, new_underruns,
-                 stat_dropped_sbc, stat_trims, frames_to_ms(total));
+                 stat_dropped_sbc, stat_trims, new_reclaims, frames_to_ms(total));
     }
     stat_dropped_sbc = 0;
     stat_trims = 0;
     btstack_run_loop_set_timer(ts, STATS_INTERVAL_MS);
     btstack_run_loop_add_timer(ts);
+}
+
+// Another app took the audio - in a car usually the Music app, which the head unit tells to
+// play after a track change. Pause it (only with car controls on, and never after the media
+// code crashed once), then the audio driver takes the audio back.
+static void audio_before_reclaim(void){
+    if (!media_controls_enabled || media_state <= 0) return;
+    media_guard_set("pause_music");
+    media_controls_pause_system_music();
+    media_guard_clear();
+}
+
+// Playing again: re-publish the track so we are the Now Playing app again and the head unit's
+// buttons come back to us.
+static void audio_after_reclaim(void){
+    if (media_state > 0 && media_controls_enabled && a2dp_connection.connected){
+        media_controls_refresh();
+    }
 }
 
 static void media_processing_init(media_codec_configuration_sbc_t * configuration){
@@ -486,10 +528,11 @@ static void media_processing_init(media_codec_configuration_sbc_t * configuratio
         audio_sink->set_volume(volume_percentage * 127 / 100);
     }
     btstack_audio_ios_set_available_handler(&sink_pcm_frames_available);
+    btstack_audio_ios_set_reclaim_handlers(&audio_before_reclaim, &audio_after_reclaim);
     audio_stream_started = 0;
     media_initialized = 1;
 
-    stat_dropped_sbc = stat_trims = stat_underruns_seen = 0;
+    stat_dropped_sbc = stat_trims = stat_underruns_seen = stat_reclaims_seen = 0;
     stat_ticks = 0;
     btstack_run_loop_remove_timer(&stats_timer);
     btstack_run_loop_set_timer_handler(&stats_timer, &stats_timer_handler);

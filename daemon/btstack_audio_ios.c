@@ -17,6 +17,11 @@
  * A buffer is only filled when enough audio is buffered (available handler). After a
  * Bluetooth stall the queue runs dry once, refills a few buffers' worth and resumes
  * cleanly, instead of crackling with half-empty buffers.
+ *
+ * Interruptions: if another app takes the audio (a car head unit telling the Music app to
+ * play, for example), iOS interrupts our session and stops the queue. An IsRunning
+ * property listener notices, and the BTstack thread takes the audio back: pause the other
+ * player (handler), re-activate the session, rebuild the queue from the buffered audio.
  */
 
 #include "btstack_config.h"
@@ -41,6 +46,9 @@
 #define AVAILABLE_MARGIN    256     // resampling can need a few more input frames
 #define REBUFFER_BUFFERS    3       // after running dry, wait for this much audio
 #define FALLBACK_TIMER_MS   40      // belt and braces; the pipe does the real work
+#define RECLAIM_DELAY_MS    250     // let the other app's start settle first
+#define RECLAIM_MAX_DELAY_MS 5000   // backoff limit while we keep losing the audio
+#define RECLAIM_QUIET_MS    10000   // this long without an interruption resets the backoff
 
 static void (*playback_callback)(int16_t * buffer, uint16_t num_samples, const btstack_audio_context_t * context);
 static uint32_t (*available_handler)(void);
@@ -51,7 +59,8 @@ static AudioStreamBasicDescription stream_format;
 static uint32_t            sample_rate;
 static uint8_t             num_channels;
 static float               queue_volume = 1.0f;
-static volatile int        stream_running;
+static volatile int        stream_running;   // queue built and started (or starting)
+static int                 stream_wanted;    // the sink wants audio: keep reclaiming until stop
 
 // played buffers: single producer (AudioQueue thread), single consumer (BTstack thread)
 static AudioQueueBufferRef free_queue[FREE_QUEUE_SIZE];
@@ -66,6 +75,15 @@ static uint32_t            underruns;
 static int                    wake_pipe[2] = { -1, -1 };
 static btstack_data_source_t  wake_data_source;
 static btstack_timer_source_t fallback_timer;
+
+// interruption recovery
+static volatile int           interrupted;    // set on the AudioQueue thread
+static btstack_timer_source_t reclaim_timer;
+static unsigned int           reclaim_streak; // consecutive interruptions -> backoff
+static uint32_t               last_reclaim_ms;
+static uint32_t               reclaims;
+static void (*before_reclaim_handler)(void);
+static void (*after_reclaim_handler)(void);
 
 static AudioQueueBufferRef free_queue_pop(void){
     uint32_t r = free_read;
@@ -90,7 +108,35 @@ static void aq_output_callback(void * user_data, AudioQueueRef aq, AudioQueueBuf
     (void) n;
 }
 
+// AudioQueue thread: the queue stopped without us stopping it -> interrupted by another app
+static void is_running_listener(void * user_data, AudioQueueRef aq, AudioQueuePropertyID property){
+    (void) user_data;
+    (void) property;
+    if (!__atomic_load_n(&stream_running, __ATOMIC_ACQUIRE)) return;   // we stopped it ourselves
+    UInt32 running = 1;
+    UInt32 size = sizeof(running);
+    if (AudioQueueGetProperty(aq, kAudioQueueProperty_IsRunning, &running, &size) != 0) return;
+    if (running) return;
+    __atomic_store_n(&interrupted, 1, __ATOMIC_RELEASE);
+    char c = 0;
+    ssize_t n = write(wake_pipe[1], &c, 1);
+    (void) n;
+}
+
 // BTstack thread
+static void reclaim_timer_handler(btstack_timer_source_t * ts);
+
+static void schedule_reclaim(void){
+    uint32_t now = btstack_run_loop_get_time_ms();
+    if (now - last_reclaim_ms > RECLAIM_QUIET_MS) reclaim_streak = 0;
+    uint32_t delay = RECLAIM_DELAY_MS << btstack_min(reclaim_streak, 5);
+    if (delay > RECLAIM_MAX_DELAY_MS) delay = RECLAIM_MAX_DELAY_MS;
+    btstack_run_loop_remove_timer(&reclaim_timer);
+    btstack_run_loop_set_timer_handler(&reclaim_timer, &reclaim_timer_handler);
+    btstack_run_loop_set_timer(&reclaim_timer, delay);
+    btstack_run_loop_add_timer(&reclaim_timer);
+}
+
 static int enqueue(AudioQueueBufferRef b){
     btstack_audio_context_t context;
     memset(&context, 0, sizeof(context));
@@ -131,6 +177,11 @@ static void wake_handler(btstack_data_source_t * ds, btstack_data_source_callbac
     (void) type;
     char buf[16];
     while (read(ds->source.fd, buf, sizeof(buf)) > 0) {}
+    if (__atomic_exchange_n(&interrupted, 0, __ATOMIC_ACQ_REL)){
+        log_info("audio: another app took the audio (AudioQueue stopped)");
+        schedule_reclaim();
+        return;
+    }
     fill_free_buffers();
 }
 
@@ -191,6 +242,8 @@ static int create_queue(void){
         queue = NULL;
         return -1;
     }
+    err = AudioQueueAddPropertyListener(queue, kAudioQueueProperty_IsRunning, &is_running_listener, NULL);
+    if (err) log_error("audio: cannot watch for interruptions: %d", (int) err);
     int i;
     for (i = 0; i < NUM_BUFFERS; i++){
         err = AudioQueueAllocateBuffer(queue, BUFFER_FRAMES * stream_format.mBytesPerFrame, &aq_buffers[i]);
@@ -242,9 +295,8 @@ static void ios_audio_set_volume(uint8_t volume){
     if (queue) AudioQueueSetParameter(queue, kAudioQueueParam_Volume, queue_volume);
 }
 
-static void ios_audio_start_stream(void){
-    if (stream_running || !playback_callback) return;
-    if (!queue && create_queue()) return;
+static OSStatus start_queue(void){
+    if (!queue && create_queue()) return -1;
 
     // every buffer starts out free
     unsigned int i;
@@ -272,16 +324,59 @@ static void ios_audio_start_stream(void){
     btstack_run_loop_set_timer_handler(&fallback_timer, &fallback_timer_handler);
     btstack_run_loop_set_timer(&fallback_timer, FALLBACK_TIMER_MS);
     btstack_run_loop_add_timer(&fallback_timer);
+    return err;
 }
 
-static void ios_audio_stop_stream(void){
-    if (!stream_running) return;
+static void ios_audio_start_stream(void){
+    if (stream_running || !playback_callback) return;
+    stream_wanted = 1;
+    reclaims = 0;
+    reclaim_streak = 0;
+    start_queue();
+}
+
+static void tear_down_queue(void){
     __atomic_store_n(&stream_running, 0, __ATOMIC_RELEASE);
     btstack_run_loop_remove_timer(&fallback_timer);
-    // tear the queue down; start_stream builds a fresh one
     close_queue();
     held_buffer = NULL;
     __atomic_store_n(&frames_queued, 0, __ATOMIC_RELEASE);
+}
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+static void reclaim_timer_handler(btstack_timer_source_t * ts){
+    (void) ts;
+    if (!stream_wanted) return;   // stream ended meanwhile
+    last_reclaim_ms = btstack_run_loop_get_time_ms();
+    reclaim_streak++;
+
+    if (before_reclaim_handler) (*before_reclaim_handler)();      // e.g. pause the Music app
+
+    OSStatus err = AudioSessionSetActive(true);
+    if (err) log_error("audio: AudioSessionSetActive failed: %d", (int) err);
+
+    // rebuild the queue from the buffered audio (an interrupted queue can be left in odd states)
+    tear_down_queue();
+    err = start_queue();
+    if (err){
+        log_error("audio: could not take the audio back (%d), retrying", (int) err);
+        schedule_reclaim();
+        return;
+    }
+    reclaims++;
+    log_info("audio: took the audio back (%u time%s this stream)", reclaims, reclaims == 1 ? "" : "s");
+    if (after_reclaim_handler) (*after_reclaim_handler)();         // e.g. re-assert Now Playing
+}
+#pragma clang diagnostic pop
+
+static void ios_audio_stop_stream(void){
+    stream_wanted = 0;
+    btstack_run_loop_remove_timer(&reclaim_timer);
+    __atomic_store_n(&interrupted, 0, __ATOMIC_RELEASE);
+    if (!stream_running) return;
+    // tear the queue down; start_stream builds a fresh one
+    tear_down_queue();
 }
 
 static void ios_audio_close(void){
@@ -318,4 +413,13 @@ uint32_t btstack_audio_ios_get_queued_frames(void){
 
 uint32_t btstack_audio_ios_get_underruns(void){
     return underruns;
+}
+
+void btstack_audio_ios_set_reclaim_handlers(void (*before_reclaim)(void), void (*after_reclaim)(void)){
+    before_reclaim_handler = before_reclaim;
+    after_reclaim_handler  = after_reclaim;
+}
+
+uint32_t btstack_audio_ios_get_reclaims(void){
+    return reclaims;
 }
