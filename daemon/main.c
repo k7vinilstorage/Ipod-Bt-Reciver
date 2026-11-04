@@ -11,6 +11,11 @@
  * more than a few seconds it exits; launchd starts it again and it goes back to waiting.
  * One process = at most one Bluetooth session, so every session starts from a clean state.
  *
+ * "Keep music service running" (settings file): the receiver is the iPod's playing music
+ * app all the time, Bluetooth on or off (sink.c). It starts with the process, before
+ * Bluetooth, so a waiting daemon already plays when the car's head unit connects; the
+ * restart after power loss happens while the car is off.
+ *
  * Usage: a2dpsinkd [-f] [-d]
  *   -f  run even if the enabled flag is missing (manual testing over SSH)
  *   -d  write an HCI packet log to /tmp/a2dpsink.pklg (open with Wireshark / PacketLogger)
@@ -60,8 +65,10 @@ typedef uint32_t IOPMAssertionLevel;
 int IOPMAssertionCreateWithName(CFStringRef type, IOPMAssertionLevel level, CFStringRef name, IOPMAssertionID * id);
 int IOPMAssertionRelease(IOPMAssertionID id);
 #define kIOPMAssertionLevelOn 255
-CFTypeRef   IOPSCopyPowerSourcesInfo(void);
-CFStringRef IOPSGetProvidingPowerSourceType(CFTypeRef snapshot);
+CFTypeRef       IOPSCopyPowerSourcesInfo(void);
+CFStringRef     IOPSGetProvidingPowerSourceType(CFTypeRef snapshot);
+CFArrayRef      IOPSCopyPowerSourcesList(CFTypeRef snapshot);
+CFDictionaryRef IOPSGetPowerSourceDescription(CFTypeRef snapshot, CFTypeRef source);
 
 static IOPMAssertionID power_assertion;
 
@@ -94,6 +101,7 @@ static int setting_only_when_charging;
 static int setting_auto_reconnect = 1;
 static int setting_auto_play;
 static int setting_media_controls = 1;   // lock screen + car/USB buttons, on by default
+static int setting_music_service;        // stay the playing music app all the time
 
 // --- helpers ---
 
@@ -102,6 +110,7 @@ static void load_settings(void){
     setting_auto_reconnect = 1;
     setting_auto_play = 0;
     setting_media_controls = 1;
+    setting_music_service = 0;
     FILE * f = fopen(SINK_SETTINGS_FILE, "r");
     if (!f) return;
     char line[64];
@@ -111,24 +120,48 @@ static void load_settings(void){
         if (sscanf(line, "auto_reconnect=%d", &value) == 1)     setting_auto_reconnect = value != 0;
         if (sscanf(line, "auto_play=%d", &value) == 1)          setting_auto_play = value != 0;
         if (sscanf(line, "media_controls=%d", &value) == 1)     setting_media_controls = value != 0;
+        if (sscanf(line, "music_service=%d", &value) == 1)      setting_music_service = value != 0;
     }
     fclose(f);
 }
 
-static int on_external_power(void){
+// external power (charger, computer, car) and the battery level in percent (-1 = unknown)
+static void read_power(int * external, int * battery_percent){
+    static int warned;
+    *external = 1;
+    *battery_percent = -1;
     CFTypeRef info = IOPSCopyPowerSourcesInfo();
     if (!info){
-        log_error("a2dpsinkd: cannot read power source, assuming external power");
-        return 1;
+        if (!warned) log_error("a2dpsinkd: cannot read power source, assuming external power");
+        warned = 1;
+        return;
     }
     CFStringRef type = IOPSGetProvidingPowerSourceType(info);
-    int ac = type && CFStringCompare(type, CFSTR("AC Power"), 0) == kCFCompareEqualTo;
+    *external = type && CFStringCompare(type, CFSTR("AC Power"), 0) == kCFCompareEqualTo;
+    CFArrayRef list = IOPSCopyPowerSourcesList(info);
+    if (list){
+        CFIndex i;
+        for (i = 0; i < CFArrayGetCount(list) && *battery_percent < 0; i++){
+            CFDictionaryRef ps = IOPSGetPowerSourceDescription(info, CFArrayGetValueAtIndex(list, i));
+            if (!ps) continue;
+            CFTypeRef cur = CFDictionaryGetValue(ps, CFSTR("Current Capacity"));
+            CFTypeRef max = CFDictionaryGetValue(ps, CFSTR("Max Capacity"));
+            int c = 0, m = 0;
+            if (cur && max && CFGetTypeID(cur) == CFNumberGetTypeID() && CFGetTypeID(max) == CFNumberGetTypeID()
+                && CFNumberGetValue((CFNumberRef) cur, kCFNumberIntType, &c)
+                && CFNumberGetValue((CFNumberRef) max, kCFNumberIntType, &m) && m > 0){
+                *battery_percent = c * 100 / m;
+            }
+        }
+        CFRelease(list);
+    }
     CFRelease(info);
-    return ac;
 }
 
-static int receiver_wanted(void){
-    return !setting_only_when_charging || on_external_power();
+static int on_external_power(void){
+    int external, battery;
+    read_power(&external, &battery);
+    return external;
 }
 
 static void load_name(void){
@@ -156,8 +189,8 @@ static void raise_priority(void){
 // --- shutdown ---
 
 static void finish(int exit_code){
+    sink_shutdown_audio();     // also the music service, which runs without Bluetooth
     if (bluetooth_started){
-        sink_shutdown_audio();
         btstack_control_ipod_restore_system_bluetooth();
         btstack_tlv_posix_deinit(&tlv_context);
     }
@@ -263,7 +296,7 @@ static void start_bluetooth(void){
     hci_event_callback_registration.callback = &hci_event_handler;
     hci_add_event_handler(&hci_event_callback_registration);
 
-    sink_setup(local_name, btstack_audio_ios_sink_get_instance());
+    sink_setup(local_name);
     sink_set_auto_reconnect(setting_auto_reconnect);
     sink_set_auto_play(setting_auto_play);
     sink_set_media_controls(setting_media_controls);
@@ -286,7 +319,14 @@ static void evaluate(void){
     }
 
     load_settings();
-    int wanted = receiver_wanted();
+    int external, battery;
+    read_power(&external, &battery);
+    int wanted = !setting_only_when_charging || external;
+
+    // Now Playing and the music service work with or without Bluetooth
+    sink_set_power_state(external, battery);
+    sink_set_media_controls(setting_media_controls);
+    sink_set_music_service(setting_music_service);
 
     if (!bluetooth_started){
         if (wanted) start_bluetooth();
@@ -309,7 +349,6 @@ static void evaluate(void){
 
     sink_set_auto_reconnect(setting_auto_reconnect);
     sink_set_auto_play(setting_auto_play);
-    sink_set_media_controls(setting_media_controls);
 
     if (hci_working && access(SINK_FORGET_FLAG, F_OK) == 0){
         log_info("a2dpsinkd: forgetting all paired devices");
@@ -427,13 +466,23 @@ int main(int argc, const char * argv[]){
     setup_signals();
     setup_power_notifications();
 
+    // audio first: with the music service it plays (silently) before Bluetooth is up, so a
+    // head unit connecting at the same time as the power finds a playing iPod
+    int external, battery;
+    read_power(&external, &battery);
+    sink_init_audio(btstack_audio_ios_sink_get_instance());
+    sink_set_power_state(external, battery);
+    sink_set_media_controls(setting_media_controls);
+    sink_set_music_service(setting_music_service);
+
     btstack_run_loop_set_timer_handler(&poll_timer, &poll_timer_handler);
 
-    if (receiver_wanted()){
+    if (!setting_only_when_charging || external){
         start_bluetooth();
         btstack_run_loop_set_timer(&poll_timer, POLL_INTERVAL_MS);
     } else {
-        printf("a2dpsinkd: 'only while charging' is on and there is no external power, waiting\n");
+        printf("a2dpsinkd: 'only while charging' is on and there is no external power, waiting%s\n",
+               setting_music_service ? " (music service running)" : "");
         sink_status_set_state(SINK_STATE_WAITING_POWER);
         btstack_run_loop_set_timer(&poll_timer, IDLE_POLL_INTERVAL_MS);
     }

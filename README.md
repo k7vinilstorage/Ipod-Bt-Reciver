@@ -87,7 +87,7 @@ Then, inside this folder:
 make package FINALPACKAGE=1
 ```
 
-This produces `packages/local.a2dpsink_0.4.6_iphoneos-arm.deb`.
+This produces `packages/local.a2dpsink_0.4.7_iphoneos-arm.deb`.
 
 ## Install
 
@@ -142,7 +142,8 @@ kept awake. The screen can turn off, but the device won't sleep, so keep it plug
   Head units in iPod mode only switch their audio on when the iPod announces a new
   track (that's why the sound used to come on only after pressing next). Once the
   phone's audio is playing after it connects, the receiver announces the current song
-  once more, so the song number goes up by one at the start — that's expected.
+  once more, so the song number goes up by one at the start — that's expected. If the
+  sound still only comes on after next, turn on **Keep Music Service Running** (below).
 
   If the head unit still starts the iPod's **Music app** (some do after a track change or
   when you switch to the USB source), the receiver notices, pauses Music and takes the
@@ -154,6 +155,18 @@ kept awake. The screen can turn off, but the device won't sleep, so keep it plug
 
   This part is isolated from the receiver: if it can't start on your iPod (or crashes), it
   switches itself off, the app shows a warning, and Bluetooth audio keeps working.
+- **Keep Music Service Running** (off by default): the receiver stays the iPod's *playing*
+  music app all the time, also while Bluetooth is off (Only While Charging, car switched off).
+  It plays silence and shows **BT Receiver – Waiting for phone** until the phone's music
+  comes in, which then follows the silence without a gap. Some head units decide at the
+  moment the iPod is plugged in (ignition on) whether there is a playing iPod; they showed
+  *no file* and kept their sound off until next was pressed. With this switch they find a
+  playing iPod right away. Needs **Lock Screen & Car Controls**.
+
+  It costs about as much battery as playing music with the screen off. Without a charger it
+  gives way when another audio app starts playing and comes back when power is connected,
+  and it pauses itself below 20 % battery until the iPod is charging again (a flat battery
+  would also mean jailbreaking again). The app's *Music Service* line shows what it is doing.
 - **Name** and **Forget Paired Devices**.
 
 ## Audio quality tips
@@ -186,7 +199,7 @@ Where things are most likely to break, in order:
 | `socket(PF_NETGRAPH) failed` / `ioctl(... com.apple.uart.bluetooth) failed` | Something still holds the UART. Check `ps ax \| grep -i -e blue -e BTServer` |
 | `Bluetooth controller did not respond` | BlueTool bring-up or UART speed. Check the `BlueTool >` lines and `transport-speed` |
 | Connects but no sound | AudioQueue from a daemon. Look for `AudioQueue…failed` lines |
-| Stutters | Raise `OPTIMAL_FRAMES_MIN/MAX` in `daemon/sink.c` |
+| Stutters | Raise `TARGET_FRAMES` / `START_FRAMES` in `daemon/sink.c` |
 
 If iOS Bluetooth stays dead afterwards (for example after a crash), reboot. Or load the
 Apple jobs again by hand:
@@ -200,11 +213,11 @@ launchctl load /System/Library/LaunchDaemons/com.apple.BTServer.plist
 | Path | What |
 |---|---|
 | `daemon/main.c` | Startup, launchd and flag-file handling, signals, shutdown |
-| `daemon/sink.c` | A2DP sink, AVRCP, SBC decode, clock-drift resampling (from BTstack's `a2dp_sink_demo.c`) |
+| `daemon/sink.c` | A2DP sink, AVRCP, SBC decode, clock-drift resampling (from BTstack's `a2dp_sink_demo.c`), music service |
 | `daemon/btstack_control_ipod.c` | Stops/starts Apple's Bluetooth, configures the chip with BlueTool |
 | `daemon/hci_transport_h4_ipod.c` | H4 over the netgraph UART socket |
 | `daemon/media_controls.m` | Now Playing / lock screen and car-button forwarding (MediaPlayer loaded at runtime) |
-| `daemon/btstack_audio_ios.c` | AudioQueue output (lock-free hand-off between threads) |
+| `daemon/btstack_audio_ios.c` | AudioQueue output (lock-free hand-off between threads, self-refilling silence, taking the audio back) |
 | `daemon/ios9_compat.h` | `clock_gettime` replacement (it only exists on iOS 10+) |
 | `app/` | The BT Receiver settings app |
 | `layout/` | LaunchDaemon plist, Debian install scripts |

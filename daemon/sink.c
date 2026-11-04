@@ -7,6 +7,12 @@
  * Media path: L2CAP media packets -> SBC frames into a ring buffer -> decoded on demand
  * when the audio driver asks for PCM -> resampled slightly faster/slower to keep the
  * buffer level stable (phone and iPod clocks drift) -> AudioQueue.
+ *
+ * Music service (optional, "Keep Music Service Running"): the receiver stays the iPod's
+ * playing music app all the time. While no phone audio plays, the AudioQueue plays silence
+ * and Now Playing shows a "Waiting for phone" track - also while Bluetooth is off. A car
+ * head unit that connects (ignition on) finds an iPod that is already playing and switches
+ * its audio on; the phone's audio then follows the silence in the same, running queue.
  */
 
 #include "btstack_config.h"
@@ -43,6 +49,8 @@
 #define BAND_FRAMES         3072                      // within +-70 ms of target: no correction
 #define TRIM_ABOVE_FRAMES   (TARGET_FRAMES + 22050)   // >0.5 s too much: skip ahead once
 #define SBC_STORAGE_FRAMES  512                       // ~1.5 s of SBC
+#define SEAMLESS_START_FRAMES 4096                    // with the queue playing silence (~11000 frames
+                                                      // queued) this is enough to switch to the audio
 #define STATS_INTERVAL_MS   5000
 #define STATS_HEALTH_TICKS  6                         // health line every 30 s
 
@@ -114,6 +122,23 @@ static struct {
 } avrcp_connection;
 
 static const btstack_audio_sink_t * audio_sink;
+static int audio_configured;         // the driver has a format and our playback handler
+
+// --- music service state (logic further down, after the audio pipeline) ---
+
+#define MUSIC_SERVICE_MIN_BATTERY  20       // percent: below this, without a charger, it stops
+
+static int      music_service;
+static int      music_yielded;       // another app took the audio while no phone was connected, on battery
+static int      external_power = 1;
+static int      battery_stop;        // battery low and no charger
+static uint32_t silence_rate = 44100;          // the last phone stream's sample rate
+static uint32_t placeholder_since;
+
+// the music service wants the queue playing (silence while no phone audio plays)
+static int music_silence_wanted(void){
+    return music_service && !battery_stop && !music_yielded;
+}
 
 // --- auto reconnect ---
 //
@@ -276,12 +301,20 @@ static int remote_status_known;        // the phone has reported its play status
 #define AVRCP_GIVE_UP_MS        5000    // controller stuck busy this long: drop queued requests
 #define TRANSPORT_QUEUE_SIZE    8
 
+// The music service's stand-in track while no phone track is known
+#define PLACEHOLDER_TITLE      "BT Receiver"
+#define PLACEHOLDER_WAITING    "Waiting for phone"
+#define PLACEHOLDER_CONNECTED  "Phone connected"
+
+enum { PUBLISHED_NOTHING, PUBLISHED_PLACEHOLDER, PUBLISHED_TRACK };
+
 static void sink_media_command(media_command_t cmd);
 
 static int  media_controls_enabled = 1;
 static int  media_hci_ready;          // Bluetooth is up, safe to start media controls
 static int  media_state;              // 0 = not started, 1 = ready, -1 = unavailable / failed
 static int  media_activated_once;
+static int  media_active;             // we are the Now Playing app (media_controls_set_active)
 
 static char     cur_title[128];
 static char     cur_artist[128];
@@ -292,6 +325,9 @@ static uint32_t cur_position_time;
 static int      position_running;     // elapsed time advancing (phone playing)
 static uint32_t queue_index = QUEUE_START_INDEX;
 static int      published_playing;    // debounced play state shown to iOS
+static int      published_kind;       // PUBLISHED_*: what iOS shows right now
+static uint32_t published_index;      // ... and at which playlist position
+static int      have_track_info;      // the phone's track info came in since it connected
 static uint32_t last_nav_time;        // last next/previous forwarded to the phone
 static uint32_t last_stop_time;       // last (ignored) stop from the lock screen / head unit
 static uint32_t last_pause_cmd_time;  // last pause the user asked for
@@ -481,41 +517,74 @@ static int media_ensure_ready(void){
     return ok;
 }
 
-// publish everything we know: the app's status file always, iOS when car controls are on
+// publish everything we know: the app's status file always, iOS when car controls are on.
+// With the music service a stand-in track shows while no phone track is known.
 static void media_publish(void){
     sink_status_set_timing(cur_duration_ms, position_now_ms(), position_running);
     if (track_info_pending) return;      // published together with the new track's info
-    if (!(media_state > 0 && media_controls_enabled && a2dp_connection.connected)) return;
+    if (!media_active) return;
+    int kind;
+    if (a2dp_connection.connected && (have_track_info || !music_service)){
+        kind = PUBLISHED_TRACK;
+    } else if (music_service){
+        kind = PUBLISHED_PLACEHOLDER;
+    } else {
+        return;
+    }
+    // head units read a track's info when the playlist position changes: the stand-in and
+    // the phone's track must not show up at the same position
+    if (published_kind != PUBLISHED_NOTHING && kind != published_kind && queue_index == published_index){
+        queue_index_step(+1);
+    }
+    if (kind == PUBLISHED_PLACEHOLDER && published_kind != PUBLISHED_PLACEHOLDER) placeholder_since = now_ms();
+
     media_now_playing_t np;
-    np.title       = cur_title;
-    np.artist      = cur_artist;
-    np.album       = cur_album;
-    np.duration_ms = cur_duration_ms;
-    np.position_ms = position_now_ms();
-    np.playing     = published_playing;
+    memset(&np, 0, sizeof(np));
     np.queue_index = queue_index;
     np.queue_count = QUEUE_COUNT;
+    if (kind == PUBLISHED_TRACK){
+        np.title       = cur_title;
+        np.artist      = cur_artist;
+        np.album       = cur_album;
+        np.duration_ms = cur_duration_ms;
+        np.position_ms = position_now_ms();
+        np.playing     = published_playing;
+    } else {
+        np.title       = PLACEHOLDER_TITLE;
+        np.artist      = a2dp_connection.connected ? PLACEHOLDER_CONNECTED : PLACEHOLDER_WAITING;
+        np.album       = "";
+        np.position_ms = now_ms() - placeholder_since;
+        np.playing     = 1;      // a playing music app: head units switch their audio on for it
+    }
+    published_kind  = kind;
+    published_index = queue_index;
     media_controls_set_now_playing(&np);
 }
 
 static void media_apply_active(void){
-    if (!media_hci_ready) return;
+    // started once Bluetooth is up, or right away for the music service
+    if (!media_hci_ready && !music_service && media_state <= 0) return;
     if (!media_controls_enabled){
         if (media_state > 0) media_controls_set_active(0);
+        media_active = 0;
+        published_kind = PUBLISHED_NOTHING;
         sink_status_set_media("off");
         return;
     }
     if (!media_ensure_ready()) return;
-    int want = a2dp_connection.connected;
+    int want = a2dp_connection.connected || music_silence_wanted();
     if (want && !media_activated_once){
         media_guard_set("activate");
         media_controls_set_active(1);
+        media_active = 1;
         media_publish();
         media_guard_clear();
         media_activated_once = 1;
     } else {
         media_controls_set_active(want);
+        media_active = want;
         if (want) media_publish();
+        else published_kind = PUBLISHED_NOTHING;
     }
     sink_status_set_media(want ? "active" : "ready");
 }
@@ -639,6 +708,7 @@ static void finish_track_change(void){
     queue_index_step(pending_index_step);
     pending_index_step = 0;
     play_status_logged = 0;
+    have_track_info = 1;
     log_info("track %u: '%s' by '%s'%s%s, length %u:%02u", queue_index + 1, cur_title, cur_artist,
              cur_album[0] ? " on " : "", cur_album, cur_duration_ms / 60000, (cur_duration_ms / 1000) % 60);
     media_publish();          // new position together with the new title / artist / album / length
@@ -876,11 +946,31 @@ static void stats_timer_handler(btstack_timer_source_t * ts){
     btstack_run_loop_add_timer(ts);
 }
 
+// only with car controls on, and never after the media code crashed once
+static void pause_music_app(void){
+    if (!media_controls_enabled || media_state <= 0) return;
+    media_guard_set("pause_music");
+    media_controls_pause_system_music();
+    media_guard_clear();
+}
+
+static void music_service_report(void);
+
 // Another app took the audio - in a car usually the Music app, which the head unit tells to
-// play after a track change. Pause it (only with car controls on, and never after the media
-// code crashed once), then the audio driver takes the audio back.
-static void audio_before_reclaim(void){
-    if (media_is_playing() || published_playing){
+// play after a track change. Pause it, then the audio driver takes the audio back.
+// Returns 0 to leave the audio to the other app instead.
+static int audio_before_reclaim(void){
+    if (music_service && !audio_stream_started && !external_power){
+        // just the music service's silence and no charger: someone uses the iPod for something
+        // else. Let them; the music service comes back once power is connected (the phone's
+        // audio takes over whenever it plays).
+        log_info("music service: another app is playing on battery, leaving the audio to it until the iPod is charging");
+        music_yielded = 1;
+        media_apply_active();
+        music_service_report();
+        return 0;
+    }
+    if (a2dp_connection.connected && (media_is_playing() || published_playing)){
         // the head unit said "stop" and then started the Music app: its way of doing "next"
         if (last_stop_time && now_ms() - last_stop_time < STOP_AS_SKIP_MS){
             log_info("media: stop + Music app starting = the head unit's next, skipping on the phone");
@@ -893,18 +983,81 @@ static void audio_before_reclaim(void){
         log_info("media: the head unit started the Music app while the phone is paused, resuming the phone");
         sink_media_command(MEDIA_CMD_PLAY);
     }
-    if (!media_controls_enabled || media_state <= 0) return;
-    media_guard_set("pause_music");
-    media_controls_pause_system_music();
-    media_guard_clear();
+    pause_music_app();
+    return 1;
 }
 
 // Playing again: re-publish the track so we are the Now Playing app again and the head unit's
 // buttons come back to us.
 static void audio_after_reclaim(void){
-    if (!a2dp_connection.connected) return;
     media_publish();
-    headunit_kick_schedule();     // the head unit may have switched to the Music app's audio
+    if (a2dp_connection.connected) headunit_kick_schedule();   // the head unit may have switched to the Music app's audio
+}
+
+// --- audio output: the phone's audio, silence, or nothing ---
+//
+// While the phone is paused the queue keeps playing silently (keep-alive, up to
+// KEEPALIVE_MAX_MS): iOS keeps treating us as the active player, the way it does for a
+// paused music app, and if the head unit starts the Music app meanwhile we notice
+// (interruption) and take the audio back. The music service plays silence whenever no
+// phone audio plays, with no time limit.
+
+#define KEEPALIVE_MAX_MS (10 * 60 * 1000)
+static btstack_timer_source_t keepalive_timer;
+static int keepalive_armed;
+
+static void audio_configure(uint32_t rate){
+    if (!audio_sink) return;
+    audio_sink->init(NUM_CHANNELS, rate, &playback_handler);     // keeps a running queue of the same format
+    audio_sink->set_volume(volume_percentage * 127 / 100);
+    btstack_audio_ios_set_available_handler(&sink_pcm_frames_available);
+    btstack_audio_ios_set_reclaim_handlers(&audio_before_reclaim, &audio_after_reclaim);
+    audio_configured = 1;
+}
+
+static void audio_play_silence(void){
+    if (!audio_sink) return;
+    if (!audio_configured) audio_configure(silence_rate);
+    btstack_audio_ios_set_silence_fill(1);
+    if (!btstack_audio_ios_is_started()) audio_sink->start_stream();
+}
+
+static void audio_close(void){
+    if (audio_sink && audio_configured) audio_sink->close();
+    audio_configured = 0;
+}
+
+// no phone audio playing: keep the queue playing silence, or stop it
+static void audio_idle_update(void){
+    if (audio_stream_started) return;
+    if (music_silence_wanted() || keepalive_armed){
+        audio_play_silence();
+    } else if (!media_initialized){
+        audio_close();
+    } else if (audio_sink && btstack_audio_ios_is_started()){
+        audio_sink->stop_stream();
+    }
+}
+
+static void keepalive_disarm(void){
+    keepalive_armed = 0;
+    btstack_run_loop_remove_timer(&keepalive_timer);
+}
+
+static void keepalive_timeout_handler(btstack_timer_source_t * ts){
+    UNUSED(ts);
+    keepalive_armed = 0;
+    if (audio_stream_started) return;
+    if (!music_silence_wanted()) log_info("audio: paused for %u min, stopping the silent stream", KEEPALIVE_MAX_MS / 60000);
+    audio_idle_update();
+}
+
+static void keepalive_arm(void){
+    keepalive_armed = 1;
+    btstack_run_loop_remove_timer(&keepalive_timer);
+    btstack_run_loop_set_timer_handler(&keepalive_timer, &keepalive_timeout_handler);
+    btstack_run_loop_set_timer(&keepalive_timer, KEEPALIVE_MAX_MS);
+    btstack_run_loop_add_timer(&keepalive_timer);
 }
 
 static void media_processing_init(media_codec_configuration_sbc_t * configuration){
@@ -922,12 +1075,9 @@ static void media_processing_init(media_codec_configuration_sbc_t * configuratio
     pcm_frames_per_sbc_frame = (blocks >= 4 && blocks <= 16 && (bands == 4 || bands == 8)) ? blocks * bands : 128;
     sbc_frame_size = 0;
 
-    if (audio_sink){
-        audio_sink->init(NUM_CHANNELS, configuration->sampling_frequency, &playback_handler);
-        audio_sink->set_volume(volume_percentage * 127 / 100);
-    }
-    btstack_audio_ios_set_available_handler(&sink_pcm_frames_available);
-    btstack_audio_ios_set_reclaim_handlers(&audio_before_reclaim, &audio_after_reclaim);
+    // a queue already playing silence in this format keeps running: the audio follows it
+    silence_rate = configuration->sampling_frequency;
+    audio_configure(configuration->sampling_frequency);
     audio_stream_started = 0;
     media_initialized = 1;
 
@@ -939,77 +1089,80 @@ static void media_processing_init(media_codec_configuration_sbc_t * configuratio
     btstack_run_loop_add_timer(&stats_timer);
 }
 
-// While the phone is paused the audio keeps running silently (for up to KEEPALIVE_MAX_MS):
-// iOS keeps treating us as the active player, the way it does for a paused music app, and if
-// the head unit starts the Music app meanwhile we notice (interruption) and take the audio back.
-#define KEEPALIVE_MAX_MS (10 * 60 * 1000)
-static btstack_timer_source_t keepalive_timer;
-static int keepalive_active;
-
-static void keepalive_stop(void){
-    if (!keepalive_active) return;
-    keepalive_active = 0;
-    btstack_run_loop_remove_timer(&keepalive_timer);
-    btstack_audio_ios_set_silence_fill(0);
-}
-
+// enough of the phone's audio is buffered: play it
 static void media_processing_start(void){
     if (!media_initialized) return;
     audio_stream_started = 1;
+    keepalive_disarm();
+    if (music_yielded){
+        music_yielded = 0;          // the phone's audio takes the audio back in any case
+        music_service_report();
+    }
     if (!kick_done){
         kick_done = 1;
-        headunit_kick_schedule();
+        // with the music service the head unit has been playing our silence: its audio is on
+        if (!music_service) headunit_kick_schedule();
     }
-    total_avg = (int32_t) sink_pcm_frames_available();
-    log_info("audio: starting playback with %u ms buffered", frames_to_ms(total_avg));
-    if (keepalive_active){
-        // replace the queued silence with a queue primed with the new audio
-        keepalive_stop();
-        if (audio_sink) audio_sink->stop_stream();
-    }
-    if (audio_sink) audio_sink->start_stream();
+    // a queue playing silence (keep-alive, music service): the audio follows it, no gap
+    int seamless = btstack_audio_ios_is_running();
+    uint32_t queued = seamless ? btstack_audio_ios_get_queued_frames() : 0;
+    total_avg = (int32_t) (sink_pcm_frames_available() + queued);
+    log_info("audio: starting playback with %u ms buffered%s", frames_to_ms(total_avg),
+             seamless ? ", right after the silence" : "");
+    btstack_audio_ios_set_silence_fill(0);
+    if (seamless) btstack_audio_ios_kick();
+    else if (audio_sink) audio_sink->start_stream();
 }
 
-static void media_processing_pause(void){
-    if (!media_initialized) return;
-    keepalive_stop();
-    audio_stream_started = 0;
-    if (audio_sink) audio_sink->stop_stream();
-    btstack_ring_buffer_reset(&decoded_audio_ring_buffer);
-    btstack_ring_buffer_reset(&sbc_frame_ring_buffer);
-}
-
-static void keepalive_timeout_handler(btstack_timer_source_t * ts){
-    UNUSED(ts);
-    log_info("audio: paused for %u min, stopping the silent stream", KEEPALIVE_MAX_MS / 60000);
-    media_processing_pause();
-}
-
+// the phone paused (stream suspended)
 static void media_processing_suspend(void){
     if (!media_initialized) return;
-    if (!audio_stream_started || !btstack_audio_ios_is_running()){
-        media_processing_pause();
-        return;
-    }
-    audio_stream_started = 0;          // resuming waits for the buffer to fill up again
+    int was_playing = audio_stream_started && btstack_audio_ios_is_running();
+    audio_stream_started = 0;          // resuming waits for audio to be buffered again
     btstack_ring_buffer_reset(&decoded_audio_ring_buffer);
     btstack_ring_buffer_reset(&sbc_frame_ring_buffer);
-    btstack_audio_ios_set_silence_fill(1);
-    keepalive_active = 1;
-    btstack_run_loop_remove_timer(&keepalive_timer);
-    btstack_run_loop_set_timer_handler(&keepalive_timer, &keepalive_timeout_handler);
-    btstack_run_loop_set_timer(&keepalive_timer, KEEPALIVE_MAX_MS);
-    btstack_run_loop_add_timer(&keepalive_timer);
+    if (was_playing) keepalive_arm();
+    audio_idle_update();
 }
 
+// the phone's stream ended (released, disconnected, reconfigured)
 static void media_processing_close(void){
-    if (!media_initialized) return;
-    keepalive_stop();
-    media_initialized = 0;
-    audio_stream_started = 0;
-    sbc_frame_size = 0;
-    btstack_run_loop_remove_timer(&stats_timer);
-    if (audio_sink) audio_sink->close();
+    keepalive_disarm();
+    if (media_initialized){
+        media_initialized = 0;
+        audio_stream_started = 0;
+        sbc_frame_size = 0;
+        btstack_run_loop_remove_timer(&stats_timer);
+    }
+    audio_idle_update();       // the music service keeps the queue playing silence
+}
+
+// --- music service ---
+
+static const char * music_service_state(void){
+    if (!music_service) return "off";
+    if (battery_stop)   return "battery";
+    if (music_yielded)  return "yielded";
+    return "running";
+}
+
+static void music_service_report(void){
+    sink_status_set_service(music_service_state());
+}
+
+static void music_service_update(void){
+    // left the audio to another app on battery: take it back once the iPod is charging
+    // (plugged into the car, typically: the head unit is about to look for a player)
+    if (music_yielded && external_power){
+        music_yielded = 0;
+        if (music_service){
+            log_info("music service: external power, taking the audio back");
+            pause_music_app();
+        }
+    }
+    audio_idle_update();
+    media_apply_active();
+    music_service_report();
 }
 
 static int read_media_data_header(uint8_t * packet, int size, int * offset){
@@ -1056,7 +1209,9 @@ static void handle_l2cap_media_data_packet(uint8_t seid, uint8_t * packet, uint1
     btstack_ring_buffer_write(&sbc_frame_ring_buffer, packet_begin, packet_length);
 
     if (!audio_stream_started){
-        if (sink_pcm_frames_available() >= START_FRAMES) media_processing_start();
+        // a queue playing silence covers most of the buffering: switch over right after it
+        uint32_t needed = btstack_audio_ios_is_running() ? SEAMLESS_START_FRAMES : START_FRAMES;
+        if (sink_pcm_frames_available() >= needed) media_processing_start();
         return;
     }
 
@@ -1176,7 +1331,10 @@ static void a2dp_sink_packet_handler(uint8_t packet_type, uint16_t channel, uint
             remember_device(address, NULL);
             reset_track_info();
             cancel_track_change();
-            queue_index = QUEUE_START_INDEX;
+            have_track_info = 0;
+            // with the music service the head unit has seen the stand-in at this position:
+            // the playlist position goes on from there
+            if (!music_service) queue_index = QUEUE_START_INDEX;
             published_playing = 0;
             last_nav_time = last_stop_time = last_pause_cmd_time = 0;
             play_status_logged = 0;
@@ -1252,6 +1410,7 @@ static void a2dp_sink_packet_handler(uint8_t packet_type, uint16_t channel, uint
             media_processing_close();
             reset_track_info();
             cancel_track_change();
+            have_track_info = 0;
             published_playing = 0;
             btstack_run_loop_remove_timer(&time_refresh_timer);
             btstack_run_loop_remove_timer(&headunit_kick_timer);
@@ -1376,6 +1535,7 @@ static void avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channe
                     finish_track_change();
                 }
             } else {
+                have_track_info = 1;     // with the music service: replaces the stand-in now
                 media_publish();
                 request_play_status();
             }
@@ -1442,9 +1602,43 @@ static void avrcp_target_packet_handler(uint8_t packet_type, uint16_t channel, u
 
 // --- public ---
 
-void sink_setup(const char * local_name, const btstack_audio_sink_t * audio){
+void sink_init_audio(const btstack_audio_sink_t * audio){
     audio_sink = audio;
+    music_service_report();
+}
 
+void sink_set_music_service(int enabled){
+    enabled = enabled ? 1 : 0;
+    if (enabled == music_service) return;
+    music_service = enabled;
+    music_yielded = 0;
+    log_info("music service: %s", enabled ? "on, the receiver stays the playing music app" : "off");
+    music_service_update();
+}
+
+void sink_set_power_state(int on_external_power, int battery_percent){
+    on_external_power = on_external_power ? 1 : 0;
+    int stop = battery_stop;
+    if (on_external_power) stop = 0;
+    else if (battery_percent >= 0 && battery_percent < MUSIC_SERVICE_MIN_BATTERY) stop = 1;
+    if (on_external_power == external_power && stop == battery_stop) return;
+    int power_connected = on_external_power && !external_power;
+    external_power = on_external_power;
+    if (stop != battery_stop){
+        battery_stop = stop;
+        if (music_service && stop){
+            log_info("music service: battery at %d%% and no charger, pausing it until the iPod is charging", battery_percent);
+        } else if (music_service){
+            log_info("music service: charging, running again");
+        }
+    }
+    if (!music_service && !music_yielded) return;
+    // ignition on: for the head unit that is connecting now the stand-in "track" starts now
+    if (power_connected && published_kind == PUBLISHED_PLACEHOLDER) placeholder_since = now_ms();
+    music_service_update();
+}
+
+void sink_setup(const char * local_name){
     l2cap_init();
     sdp_init();
 
@@ -1554,5 +1748,7 @@ void sink_disconnect(void){
 
 void sink_shutdown_audio(void){
     if (media_state > 0) media_controls_set_active(0);
-    media_processing_close();
+    media_active = 0;
+    music_service = 0;
+    media_processing_close();      // music service off: closes the audio
 }

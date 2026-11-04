@@ -12,7 +12,7 @@
 #define SINK_LAST_DEVICE   SINK_DATA_DIR "/last_device"  // BD_ADDR of last connected phone
 #define SINK_LINK_KEY_DB   SINK_DATA_DIR "/pairings.tlv"
 #define SINK_MEDIA_GUARD   SINK_DATA_DIR "/media_guard"  // exists -> media controls crashed last time
-#define SINK_SETTINGS_FILE SINK_DATA_DIR "/settings"     // app writes: only_when_charging, auto_reconnect, auto_play, media_controls (all 0/1)
+#define SINK_SETTINGS_FILE SINK_DATA_DIR "/settings"     // app writes: only_when_charging, auto_reconnect, auto_play, media_controls, music_service (all 0/1)
 
 #define SINK_DEFAULT_NAME  "iPod Receiver"
 
@@ -39,6 +39,8 @@ void sink_status_set_reconnecting(const char * device);
 void sink_status_set_media(const char * state);
 // song timing for the app: position was measured now; it advances while playing
 void sink_status_set_timing(uint32_t duration_ms, uint32_t position_ms, int playing);
+// music service: "off", "running", "yielded" (another app has the audio) or "battery"
+void sink_status_set_service(const char * state);
 
 // write the status file now (otherwise written by the setters)
 void sink_status_flush(void);

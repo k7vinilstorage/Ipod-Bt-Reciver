@@ -26,18 +26,24 @@ uint32_t btstack_audio_ios_get_underruns(void);
 
 // Another app (typically the Music app, started by a car head unit) interrupted our audio
 // session. The driver takes the audio back on the BTstack thread: before_reclaim runs first
-// (e.g. pause the Music app), after_reclaim once our queue plays again (e.g. re-assert
-// Now Playing). Either may be NULL.
-void     btstack_audio_ios_set_reclaim_handlers(void (*before_reclaim)(void), void (*after_reclaim)(void));
+// (e.g. pause the Music app) and returns 1 to go ahead, or 0 to leave the audio to the other
+// app (the stream is then stopped, start_stream starts it again). after_reclaim runs once
+// our queue plays again (e.g. re-assert Now Playing). Either may be NULL.
+void     btstack_audio_ios_set_reclaim_handlers(int (*before_reclaim)(void), void (*after_reclaim)(void));
 
 // Number of times the audio was taken back from another app since the stream started.
 uint32_t btstack_audio_ios_get_reclaims(void);
 
-// Keep-alive: while enabled, free buffers are filled with silence instead of waiting for
-// audio, so the queue keeps playing (e.g. while the phone is paused).
+// While enabled the queue plays silence instead of waiting for audio, so it keeps running
+// (phone paused, music service). The silence needs nothing from the BTstack thread.
+// Switching it off lets queued audio follow the silence without a gap.
 void     btstack_audio_ios_set_silence_fill(int enabled);
 
 // The queue is built and playing (or starting).
 int      btstack_audio_ios_is_running(void);
+
+// start_stream was called and the stream wasn't stopped since (it may be recovering
+// from an interruption, i.e. not running right now).
+int      btstack_audio_ios_is_started(void);
 
 #endif

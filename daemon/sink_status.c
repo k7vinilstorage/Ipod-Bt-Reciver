@@ -21,6 +21,7 @@ static char title[128];
 static char artist[128];
 static char reconnecting[64];
 static char media[16];
+static char service[16] = "off";
 static uint32_t timing_duration_ms;
 static uint32_t timing_position_ms;
 static int      timing_playing;
@@ -52,6 +53,7 @@ void sink_status_flush(void){
     fprintf(f, "artist=%s\n", artist);
     fprintf(f, "reconnecting=%s\n", reconnecting);
     fprintf(f, "media=%s\n", media);
+    fprintf(f, "service=%s\n", service);
     fprintf(f, "duration_ms=%u\n", timing_duration_ms);
     fprintf(f, "position_ms=%u\n", timing_position_ms);
     fprintf(f, "position_time=%llu\n", timing_stamp_ms);
@@ -117,6 +119,13 @@ void sink_status_set_media(const char * state){
     memcpy(previous, media, sizeof(media));
     copy_clean(media, sizeof(media), state);
     if (strcmp(previous, media) != 0) sink_status_flush();
+}
+
+void sink_status_set_service(const char * state){
+    char previous[sizeof(service)];
+    memcpy(previous, service, sizeof(service));
+    copy_clean(service, sizeof(service), state);
+    if (strcmp(previous, service) != 0) sink_status_flush();
 }
 
 void sink_status_set_timing(uint32_t duration_ms, uint32_t position_ms, int playing){

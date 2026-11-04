@@ -15,8 +15,8 @@
 #define SINK_DEFAULT_NAME  @"iPod Receiver"
 
 enum { SectionReceiver, SectionStatus, SectionSettings, SectionCount };
-enum { StatusRowState, StatusRowDevice, StatusRowTrack, StatusRowTime, StatusRowCodec, StatusRowAddress, StatusRowCount };
-enum { SettingsRowName, SettingsRowCharging, SettingsRowReconnect, SettingsRowAutoPlay, SettingsRowMediaControls, SettingsRowForget, SettingsRowCount };
+enum { StatusRowState, StatusRowService, StatusRowDevice, StatusRowTrack, StatusRowTime, StatusRowCodec, StatusRowAddress, StatusRowCount };
+enum { SettingsRowName, SettingsRowCharging, SettingsRowReconnect, SettingsRowAutoPlay, SettingsRowMediaControls, SettingsRowMusicService, SettingsRowForget, SettingsRowCount };
 enum { AlertRename = 1, AlertForget = 2 };
 
 @interface RootViewController () <UIAlertViewDelegate>
@@ -25,6 +25,7 @@ enum { AlertRename = 1, AlertForget = 2 };
 @property (nonatomic, strong) UISwitch * reconnectSwitch;
 @property (nonatomic, strong) UISwitch * autoPlaySwitch;
 @property (nonatomic, strong) UISwitch * mediaControlsSwitch;
+@property (nonatomic, strong) UISwitch * musicServiceSwitch;
 @property (nonatomic, strong) NSDictionary * status;
 @property (nonatomic, strong) NSTimer * timer;
 @property (nonatomic, strong) NSDate * enabledAt;
@@ -49,6 +50,8 @@ enum { AlertRename = 1, AlertForget = 2 };
     [self.autoPlaySwitch addTarget:self action:@selector(settingSwitchChanged:) forControlEvents:UIControlEventValueChanged];
     self.mediaControlsSwitch = [[UISwitch alloc] init];
     [self.mediaControlsSwitch addTarget:self action:@selector(settingSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+    self.musicServiceSwitch = [[UISwitch alloc] init];
+    [self.musicServiceSwitch addTarget:self action:@selector(settingSwitchChanged:) forControlEvents:UIControlEventValueChanged];
     [[NSFileManager defaultManager] createDirectoryAtPath:SINK_DATA_DIR withIntermediateDirectories:YES attributes:nil error:NULL];
     [self refresh];
 }
@@ -147,7 +150,7 @@ enum { AlertRename = 1, AlertForget = 2 };
 // settings file: key=value lines, read by the daemon every second
 - (NSDictionary *)readSettings {
     NSString * text = [NSString stringWithContentsOfFile:SINK_SETTINGS_FILE encoding:NSUTF8StringEncoding error:NULL];
-    NSMutableDictionary * result = [NSMutableDictionary dictionaryWithDictionary:@{ @"only_when_charging": @"0", @"auto_reconnect": @"1", @"auto_play": @"0", @"media_controls": @"1" }];
+    NSMutableDictionary * result = [NSMutableDictionary dictionaryWithDictionary:@{ @"only_when_charging": @"0", @"auto_reconnect": @"1", @"auto_play": @"0", @"media_controls": @"1", @"music_service": @"0" }];
     for (NSString * line in [text componentsSeparatedByString:@"\n"]) {
         NSRange eq = [line rangeOfString:@"="];
         if (eq.location == NSNotFound) continue;
@@ -172,9 +175,28 @@ enum { AlertRename = 1, AlertForget = 2 };
     return [[self readSettings][@"media_controls"] intValue] != 0;
 }
 
+- (BOOL)musicService {
+    return [[self readSettings][@"music_service"] intValue] != 0;
+}
+
+// what the daemon's music service is doing right now
+- (NSString *)serviceText {
+    if (![self enabled] || ![self daemonAlive]) return [self musicService] ? @"Off (receiver not running)" : @"Off";
+    NSString * service = self.status[@"service"];
+    if ([service isEqualToString:@"running"]) {
+        NSString * state = self.status[@"state"];
+        if ([state isEqualToString:@"playing"]) return @"Playing the phone";
+        return @"Running (silent)";
+    }
+    if ([service isEqualToString:@"yielded"]) return @"Paused, another app plays";
+    if ([service isEqualToString:@"battery"]) return @"Paused, battery low";
+    return @"Off";
+}
+
 - (void)writeSettings {
-    NSString * text = [NSString stringWithFormat:@"only_when_charging=%d\nauto_reconnect=%d\nauto_play=%d\nmedia_controls=%d\n",
-                       self.chargingSwitch.on ? 1 : 0, self.reconnectSwitch.on ? 1 : 0, self.autoPlaySwitch.on ? 1 : 0, self.mediaControlsSwitch.on ? 1 : 0];
+    NSString * text = [NSString stringWithFormat:@"only_when_charging=%d\nauto_reconnect=%d\nauto_play=%d\nmedia_controls=%d\nmusic_service=%d\n",
+                       self.chargingSwitch.on ? 1 : 0, self.reconnectSwitch.on ? 1 : 0, self.autoPlaySwitch.on ? 1 : 0,
+                       self.mediaControlsSwitch.on ? 1 : 0, self.musicServiceSwitch.on ? 1 : 0];
     [text writeToFile:SINK_SETTINGS_FILE atomically:YES encoding:NSUTF8StringEncoding error:NULL];
 }
 
@@ -187,6 +209,7 @@ enum { AlertRename = 1, AlertForget = 2 };
     if (!self.reconnectSwitch.isTracking) [self.reconnectSwitch setOn:[self autoReconnect] animated:NO];
     if (!self.autoPlaySwitch.isTracking)  [self.autoPlaySwitch setOn:[self autoPlay] animated:NO];
     if (!self.mediaControlsSwitch.isTracking) [self.mediaControlsSwitch setOn:[self mediaControls] animated:NO];
+    if (!self.musicServiceSwitch.isTracking) [self.musicServiceSwitch setOn:[self musicService] animated:NO];
     [self.tableView reloadData];
 }
 
@@ -289,7 +312,7 @@ enum { AlertRename = 1, AlertForget = 2 };
         } else if ([media isEqualToString:@"unavailable"]) {
             note = @"\u26A0\uFE0F Lock Screen & Car Controls aren't available on this iOS version; the receiver itself keeps working.\n\n";
         }
-        return [note stringByAppendingString:@"Only While Charging: the receiver turns on when the iPod is connected to power (charger, computer or dock) and hands Bluetooth back to iOS 5 seconds after it is unplugged.\n\nReconnect Automatically: connects back to the last phone when the receiver starts and after the connection was lost.\n\nAuto Play on Connect: tells the phone to start playing as soon as it connects (if it isn't playing already).\n\nLock Screen & Car Controls: shows the track on the lock screen and lets the car head unit's play/pause and next/previous buttons control the phone over Bluetooth, instead of the iPod's own Music app."];
+        return [note stringByAppendingString:@"Only While Charging: the receiver turns on when the iPod is connected to power (charger, computer or dock) and hands Bluetooth back to iOS 5 seconds after it is unplugged.\n\nReconnect Automatically: connects back to the last phone when the receiver starts and after the connection was lost.\n\nAuto Play on Connect: tells the phone to start playing as soon as it connects (if it isn't playing already).\n\nLock Screen & Car Controls: shows the track on the lock screen and lets the car head unit's play/pause and next/previous buttons control the phone over Bluetooth, instead of the iPod's own Music app.\n\nKeep Music Service Running: the receiver stays the iPod's playing music app all the time, also while Bluetooth is off. It plays silence and shows \"BT Receiver – Waiting for phone\" until the phone's music comes in. A car head unit then finds a playing iPod the moment it is plugged in and switches its sound on right away. Needs Lock Screen & Car Controls. Uses about as much battery as playing music with the screen off: without a charger it gives way to other audio apps, and it pauses below 20 % battery until the iPod is charging again."];
     }
     return nil;
 }
@@ -316,6 +339,10 @@ enum { AlertRename = 1, AlertForget = 2 };
             case StatusRowState:
                 cell.textLabel.text = @"State";
                 cell.detailTextLabel.text = [self stateText];
+                break;
+            case StatusRowService:
+                cell.textLabel.text = @"Music Service";
+                cell.detailTextLabel.text = [self serviceText];
                 break;
             case StatusRowDevice: {
                 cell.textLabel.text = @"Device";
@@ -364,6 +391,10 @@ enum { AlertRename = 1, AlertForget = 2 };
         } else if (indexPath.row == SettingsRowMediaControls) {
             cell.textLabel.text = @"Lock Screen & Car Controls";
             cell.accessoryView = self.mediaControlsSwitch;
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        } else if (indexPath.row == SettingsRowMusicService) {
+            cell.textLabel.text = @"Keep Music Service Running";
+            cell.accessoryView = self.musicServiceSwitch;
             cell.selectionStyle = UITableViewCellSelectionStyleNone;
         } else {
             cell.textLabel.text = @"Forget Paired Devices";
