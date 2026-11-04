@@ -1,6 +1,8 @@
 #ifndef SINK_STATUS_H
 #define SINK_STATUS_H
 
+#include <stdint.h>
+
 // Shared with the app (runs as mobile): flag/config files and the status file
 #define SINK_DATA_DIR      "/var/mobile/Library/A2DPSink"
 #define SINK_ENABLED_FLAG  SINK_DATA_DIR "/enabled"      // exists -> launchd keeps daemon running
@@ -35,6 +37,8 @@ void sink_status_set_track(const char * title, const char * artist);
 void sink_status_set_reconnecting(const char * device);
 // media controls: "off", "ready", "active", "unavailable" or "failed"
 void sink_status_set_media(const char * state);
+// song timing for the app: position was measured now; it advances while playing
+void sink_status_set_timing(uint32_t duration_ms, uint32_t position_ms, int playing);
 
 // write the status file now (otherwise written by the setters)
 void sink_status_flush(void);

@@ -33,4 +33,11 @@ void     btstack_audio_ios_set_reclaim_handlers(void (*before_reclaim)(void), vo
 // Number of times the audio was taken back from another app since the stream started.
 uint32_t btstack_audio_ios_get_reclaims(void);
 
+// Keep-alive: while enabled, free buffers are filled with silence instead of waiting for
+// audio, so the queue keeps playing (e.g. while the phone is paused).
+void     btstack_audio_ios_set_silence_fill(int enabled);
+
+// The queue is built and playing (or starting).
+int      btstack_audio_ios_is_running(void);
+
 #endif

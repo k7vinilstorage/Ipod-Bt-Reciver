@@ -71,6 +71,7 @@ static volatile int32_t    frames_queued;    // handed to the AudioQueue, not pl
 static int                 primed;           // at least one buffer was played
 static int                 rebuffering;
 static uint32_t            underruns;
+static int                 silence_fill;     // keep-alive: play silence instead of waiting
 
 static int                    wake_pipe[2] = { -1, -1 };
 static btstack_data_source_t  wake_data_source;
@@ -153,11 +154,32 @@ static int enqueue(AudioQueueBufferRef b){
     return 1;
 }
 
+static int enqueue_silence(AudioQueueBufferRef b){
+    memset(b->mAudioData, 0, BUFFER_FRAMES * stream_format.mBytesPerFrame);
+    b->mAudioDataByteSize = BUFFER_FRAMES * stream_format.mBytesPerFrame;
+    __atomic_add_fetch(&frames_queued, BUFFER_FRAMES, __ATOMIC_ACQ_REL);
+    OSStatus err = AudioQueueEnqueueBuffer(queue, b, 0, NULL);
+    if (err){
+        __atomic_sub_fetch(&frames_queued, BUFFER_FRAMES, __ATOMIC_ACQ_REL);
+        log_error("AudioQueueEnqueueBuffer failed: %d", (int) err);
+        return 0;
+    }
+    primed = 1;
+    return 1;
+}
+
 static void fill_free_buffers(void){
     if (!__atomic_load_n(&stream_running, __ATOMIC_ACQUIRE) || !queue || !playback_callback) return;
     while (1){
         if (!held_buffer) held_buffer = free_queue_pop();
         if (!held_buffer) return;
+        if (silence_fill){
+            // phone paused: keep the queue playing (silently) so we stay the active player
+            if (!enqueue_silence(held_buffer)) return;
+            held_buffer = NULL;
+            rebuffering = 0;
+            continue;
+        }
         if (primed && !rebuffering && __atomic_load_n(&frames_queued, __ATOMIC_ACQUIRE) <= 0){
             rebuffering = 1;    // queue ran dry: build up some audio before resuming
             underruns++;
@@ -372,6 +394,7 @@ static void reclaim_timer_handler(btstack_timer_source_t * ts){
 
 static void ios_audio_stop_stream(void){
     stream_wanted = 0;
+    silence_fill = 0;
     btstack_run_loop_remove_timer(&reclaim_timer);
     __atomic_store_n(&interrupted, 0, __ATOMIC_RELEASE);
     if (!stream_running) return;
@@ -422,4 +445,13 @@ void btstack_audio_ios_set_reclaim_handlers(void (*before_reclaim)(void), void (
 
 uint32_t btstack_audio_ios_get_reclaims(void){
     return reclaims;
+}
+
+void btstack_audio_ios_set_silence_fill(int enabled){
+    silence_fill = enabled ? 1 : 0;
+    if (silence_fill) fill_free_buffers();
+}
+
+int btstack_audio_ios_is_running(void){
+    return __atomic_load_n(&stream_running, __ATOMIC_ACQUIRE);
 }

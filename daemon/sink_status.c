@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 static const char * state_names[] = {
@@ -20,6 +21,10 @@ static char title[128];
 static char artist[128];
 static char reconnecting[64];
 static char media[16];
+static uint32_t timing_duration_ms;
+static uint32_t timing_position_ms;
+static int      timing_playing;
+static unsigned long long timing_stamp_ms;   // unix time of timing_position_ms
 
 static void copy_clean(char * dst, size_t size, const char * src){
     size_t i = 0;
@@ -47,6 +52,10 @@ void sink_status_flush(void){
     fprintf(f, "artist=%s\n", artist);
     fprintf(f, "reconnecting=%s\n", reconnecting);
     fprintf(f, "media=%s\n", media);
+    fprintf(f, "duration_ms=%u\n", timing_duration_ms);
+    fprintf(f, "position_ms=%u\n", timing_position_ms);
+    fprintf(f, "position_time=%llu\n", timing_stamp_ms);
+    fprintf(f, "playing=%d\n", timing_playing);
     fprintf(f, "error=%s\n", error_message);
     fclose(f);
     chmod(tmp_path, 0644);
@@ -58,6 +67,8 @@ void sink_status_set_state(sink_state_t new_state){
     if (state != SINK_STATE_ERROR) error_message[0] = 0;
     if (state != SINK_STATE_CONNECTED && state != SINK_STATE_PLAYING){
         remote_addr[0] = remote_name[0] = codec[0] = title[0] = artist[0] = 0;
+        timing_duration_ms = timing_position_ms = 0;
+        timing_playing = 0;
     }
     if (state != SINK_STATE_READY) reconnecting[0] = 0;
     sink_status_flush();
@@ -106,4 +117,14 @@ void sink_status_set_media(const char * state){
     memcpy(previous, media, sizeof(media));
     copy_clean(media, sizeof(media), state);
     if (strcmp(previous, media) != 0) sink_status_flush();
+}
+
+void sink_status_set_timing(uint32_t duration_ms, uint32_t position_ms, int playing){
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    timing_stamp_ms    = (unsigned long long) tv.tv_sec * 1000ull + (unsigned long long) (tv.tv_usec / 1000);
+    timing_duration_ms = duration_ms;
+    timing_position_ms = position_ms;
+    timing_playing     = playing ? 1 : 0;
+    sink_status_flush();
 }

@@ -1,6 +1,8 @@
 #ifndef MEDIA_CONTROLS_H
 #define MEDIA_CONTROLS_H
 
+#include <stdint.h>
+
 // Makes a2dpsinkd iOS's "Now Playing" application while audio is streaming, so:
 //  - the connected phone's track shows on the lock screen / Control Center, and
 //  - transport buttons from the lock screen AND from accessories that drive the
@@ -29,9 +31,19 @@ int  media_controls_init(media_command_handler_t handler);
 // Enable/disable being Now Playing. Disabling clears the lock-screen info.
 void media_controls_set_active(int active);
 
-// Publish/refresh the track shown on the lock screen and head unit.
-void media_controls_set_metadata(const char * title, const char * artist, int playing);
-void media_controls_set_playing(int playing);
+typedef struct {
+    const char * title;
+    const char * artist;
+    const char * album;
+    uint32_t     duration_ms;    // 0 = unknown
+    uint32_t     position_ms;    // elapsed time right now
+    int          playing;
+    uint32_t     queue_index;    // 0-based position in the playlist shown to iOS / accessories
+    uint32_t     queue_count;    // 0 = don't publish a playlist
+} media_now_playing_t;
+
+// Publish the track shown on the lock screen, Control Center and the head unit.
+void media_controls_set_now_playing(const media_now_playing_t * info);
 
 // Re-publish the current Now Playing info (after taking the audio back from another app).
 void media_controls_refresh(void);

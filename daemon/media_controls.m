@@ -78,10 +78,21 @@ static Class      g_info_center_class;
 static id         g_commands[NUM_FORWARDED];   // retained
 static NSString * g_key_title;
 static NSString * g_key_artist;
+static NSString * g_key_album;                 // optional keys: nil if this iOS lacks them
+static NSString * g_key_duration;
+static NSString * g_key_elapsed;
 static NSString * g_key_rate;
+static NSString * g_key_queue_index;
+static NSString * g_key_queue_count;
 static NSString * g_title;                     // retained
 static NSString * g_artist;                    // retained
+static NSString * g_album;                     // retained
+static uint32_t   g_duration_ms;
+static uint32_t   g_position_ms;               // elapsed at g_position_time
+static uint32_t   g_position_time;             // btstack_run_loop_get_time_ms()
 static int        g_playing;
+static uint32_t   g_queue_index;
+static uint32_t   g_queue_count;
 static volatile uint32_t g_pending[NUM_FORWARDED];
 static btstack_timer_source_t g_pump_timer;
 
@@ -164,6 +175,11 @@ int media_controls_init(media_command_handler_t handler){
     g_key_title  = string_constant(mp, "MPMediaItemPropertyTitle",  @"title");
     g_key_artist = string_constant(mp, "MPMediaItemPropertyArtist", @"artist");
     g_key_rate   = string_constant(mp, "MPNowPlayingInfoPropertyPlaybackRate", @"MPNowPlayingInfoPropertyPlaybackRate");
+    g_key_album       = string_constant(mp, "MPMediaItemPropertyAlbumTitle", nil);
+    g_key_duration    = string_constant(mp, "MPMediaItemPropertyPlaybackDuration", nil);
+    g_key_elapsed     = string_constant(mp, "MPNowPlayingInfoPropertyElapsedPlaybackTime", nil);
+    g_key_queue_index = string_constant(mp, "MPNowPlayingInfoPropertyPlaybackQueueIndex", nil);
+    g_key_queue_count = string_constant(mp, "MPNowPlayingInfoPropertyPlaybackQueueCount", nil);
 
     unsigned int registered = 0;
     @try {
@@ -219,6 +235,14 @@ int media_controls_init(media_command_handler_t handler){
     return 1;
 }
 
+static uint32_t elapsed_now_ms(void){
+    uint32_t pos = g_position_ms;
+    if (g_playing) pos += btstack_run_loop_get_time_ms() - g_position_time;
+    if (g_duration_ms && pos > g_duration_ms) pos = g_duration_ms;
+    return pos;
+}
+
+// iOS extrapolates the elapsed time from rate, so publishing on changes is enough
 static void publish(void){
     if (!g_ready || !g_active) return;
     @try {
@@ -226,7 +250,20 @@ static void publish(void){
             NSMutableDictionary * info = [NSMutableDictionary dictionary];
             if (g_title)  [info setObject:g_title  forKey:g_key_title];
             if (g_artist) [info setObject:g_artist forKey:g_key_artist];
+            if (g_album && g_key_album) [info setObject:g_album forKey:g_key_album];
+            if (g_duration_ms && g_key_duration){
+                [info setObject:[NSNumber numberWithDouble:g_duration_ms / 1000.0] forKey:g_key_duration];
+            }
+            if (g_key_elapsed){
+                [info setObject:[NSNumber numberWithDouble:elapsed_now_ms() / 1000.0] forKey:g_key_elapsed];
+            }
             [info setObject:[NSNumber numberWithDouble:(g_playing ? 1.0 : 0.0)] forKey:g_key_rate];
+            // a playlist with tracks before and after this one: iPod-mode head units only
+            // send next/previous when they believe there is a track to go to
+            if (g_queue_count && g_key_queue_index && g_key_queue_count){
+                [info setObject:[NSNumber numberWithUnsignedInt:g_queue_index] forKey:g_key_queue_index];
+                [info setObject:[NSNumber numberWithUnsignedInt:g_queue_count] forKey:g_key_queue_count];
+            }
             set_now_playing_info(info);
         }
     } @catch (NSException * e){
@@ -252,23 +289,26 @@ void media_controls_set_active(int active){
     schedule_pump();
 }
 
-void media_controls_set_metadata(const char * title, const char * artist, int playing){
-    if (!g_ready) return;
+static NSString * copy_string(const char * s){
+    return (s && s[0]) ? [[NSString alloc] initWithUTF8String:s] : nil;   // nil for invalid UTF-8 too
+}
+
+void media_controls_set_now_playing(const media_now_playing_t * np){
+    if (!g_ready || !np) return;
     @autoreleasepool {
         [g_title release];
         [g_artist release];
-        g_title  = (title  && title[0])  ? [[NSString alloc] initWithUTF8String:title]  : nil;
-        g_artist = (artist && artist[0]) ? [[NSString alloc] initWithUTF8String:artist] : nil;
-        g_playing = playing ? 1 : 0;
+        [g_album release];
+        g_title  = copy_string(np->title);
+        g_artist = copy_string(np->artist);
+        g_album  = copy_string(np->album);
     }
-    publish();
-}
-
-void media_controls_set_playing(int playing){
-    if (!g_ready) return;
-    playing = playing ? 1 : 0;
-    if (playing == g_playing) return;
-    g_playing = playing;
+    g_duration_ms   = np->duration_ms;
+    g_position_ms   = np->position_ms;
+    g_position_time = btstack_run_loop_get_time_ms();
+    g_playing       = np->playing ? 1 : 0;
+    g_queue_index   = np->queue_index;
+    g_queue_count   = np->queue_count;
     publish();
 }
 

@@ -87,7 +87,7 @@ Then, inside this folder:
 make package FINALPACKAGE=1
 ```
 
-This produces `packages/local.a2dpsink_0.4.3_iphoneos-arm.deb`.
+This produces `packages/local.a2dpsink_0.4.4_iphoneos-arm.deb`.
 
 ## Install
 
@@ -123,19 +123,28 @@ kept awake. The screen can turn off, but the device won't sleep, so keep it plug
 - **Auto Play on Connect** (off by default): as soon as the phone connects, the iPod
   sends it a *Play* command over AVRCP, so the music starts by itself. It only does this
   once per connection, and not if the phone is already playing.
-- **Lock Screen & Car Controls** (on by default): while streaming, the iPod becomes the
-  system "Now Playing" app, so the phone's track shows on the lock screen, and the car
-  head unit's transport buttons (play/pause, next/previous — including the ones it sends
-  over the USB cable) control the *phone* over Bluetooth instead of the iPod's own Music
-  app. If a head unit or accessory misbehaves, turn this off. This part is isolated
-  from the receiver: if it can't start on your iPod (or crashes), it switches itself
-  off, the app shows a warning, and Bluetooth audio keeps working.
+- **Lock Screen & Car Controls** (on by default): while connected, the receiver acts like a
+  music app (Spotify, YouTube Music, …) on the iPod. It is the system "Now Playing" app
+  and publishes the phone's track — title, artist, album, duration and elapsed time — so
+  the lock screen shows a progress bar and the head unit can show the track and time. The
+  head unit's buttons (play/pause, next/previous, including the ones it sends over the
+  USB cable) control the *phone* over Bluetooth instead of the iPod's own Music app.
 
-  Many head units tell the iPod's own **Music app** to play after a track change, which
-  used to stop the receiver. Now the receiver notices when another app takes the audio,
-  pauses the Music app and takes the audio back within about a quarter of a second
-  (`audio: took the audio back` in the log). If your head unit keeps restarting Music
-  anyway, removing the songs from the iPod's Music library stops it for good.
+  iPod-mode head units only send next/previous when they think the current playlist has
+  another track; on a single track (what the receiver reported before 0.4.4) they send
+  *stop* instead. The receiver now reports a long playlist with the current song in the
+  middle, so next/previous come through. A *stop* is never passed on to the phone.
+
+  If the head unit still starts the iPod's **Music app** (some do after a track change or
+  when you switch to the USB source), the receiver notices, pauses Music and takes the
+  audio back within about a quarter of a second, and then skips (if you had just pressed
+  next) or resumes the phone (if it was paused). While the phone is paused the receiver
+  keeps a silent stream running for up to 10 minutes, the way a paused music app stays the
+  current player. If your head unit keeps restarting Music anyway, removing the songs
+  from the iPod's Music library stops it for good.
+
+  This part is isolated from the receiver: if it can't start on your iPod (or crashes), it
+  switches itself off, the app shows a warning, and Bluetooth audio keeps working.
 - **Name** and **Forget Paired Devices**.
 
 ## Audio quality tips

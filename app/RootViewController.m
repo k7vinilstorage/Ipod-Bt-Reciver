@@ -15,7 +15,7 @@
 #define SINK_DEFAULT_NAME  @"iPod Receiver"
 
 enum { SectionReceiver, SectionStatus, SectionSettings, SectionCount };
-enum { StatusRowState, StatusRowDevice, StatusRowTrack, StatusRowCodec, StatusRowAddress, StatusRowCount };
+enum { StatusRowState, StatusRowDevice, StatusRowTrack, StatusRowTime, StatusRowCodec, StatusRowAddress, StatusRowCount };
 enum { SettingsRowName, SettingsRowCharging, SettingsRowReconnect, SettingsRowAutoPlay, SettingsRowMediaControls, SettingsRowForget, SettingsRowCount };
 enum { AlertRename = 1, AlertForget = 2 };
 
@@ -109,6 +109,29 @@ enum { AlertRename = 1, AlertForget = 2 };
     if ([state isEqualToString:@"playing"])   return @"Playing";
     if ([state isEqualToString:@"stopping"])  return @"Stopping…";
     return state.length ? state : @"—";
+}
+
+- (NSString *)formatTime:(long long)ms {
+    if (ms < 0) ms = 0;
+    long long sec = ms / 1000;
+    if (sec >= 3600) return [NSString stringWithFormat:@"%lld:%02lld:%02lld", sec / 3600, (sec / 60) % 60, sec % 60];
+    return [NSString stringWithFormat:@"%lld:%02lld", sec / 60, sec % 60];
+}
+
+// elapsed / duration of the phone's track; the daemon writes the position with a timestamp
+- (NSString *)timeText {
+    long long duration = [self.status[@"duration_ms"] longLongValue];
+    long long position = [self.status[@"position_ms"] longLongValue];
+    long long stamp    = [self.status[@"position_time"] longLongValue];
+    BOOL playing       = [self.status[@"playing"] intValue] != 0;
+    if (duration <= 0 && position <= 0 && !playing) return @"—";
+    if (playing && stamp > 0) {
+        long long now = (long long) ([[NSDate date] timeIntervalSince1970] * 1000.0);
+        if (now > stamp) position += now - stamp;
+    }
+    if (duration > 0 && position > duration) position = duration;
+    if (duration > 0) return [NSString stringWithFormat:@"%@ / %@", [self formatTime:position], [self formatTime:duration]];
+    return [self formatTime:position];
 }
 
 - (NSString *)nonEmpty:(NSString *)s {
@@ -307,6 +330,10 @@ enum { AlertRename = 1, AlertForget = 2 };
                 cell.detailTextLabel.text = connected ? [self nonEmpty:text] : @"—";
                 break;
             }
+            case StatusRowTime:
+                cell.textLabel.text = @"Time";
+                cell.detailTextLabel.text = connected ? [self timeText] : @"—";
+                break;
             case StatusRowCodec:
                 cell.textLabel.text = @"Audio";
                 cell.detailTextLabel.text = connected ? [self nonEmpty:self.status[@"codec"]] : @"—";
