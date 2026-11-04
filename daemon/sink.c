@@ -260,8 +260,14 @@ static int remote_playing;             // from AVRCP playback status notificatio
 #define PLAY_STATUS_POLL_MS     15000   // re-sync the elapsed time with the phone
 #define NAV_SETTLE_MS           2500    // a track change this soon after next/prev is that command
 #define STOP_AS_SKIP_MS         2500    // "stop" + the Music app starting = the head unit's "next"
-#define PREVIOUS_RESTARTS_MS    3000    // phones restart the track if it played longer than this
 #define NOT_PLAYING_DEBOUNCE_MS 1500
+#define TRACK_INFO_DELAY_MS     250     // phones update their metadata just after "track changed"
+#define TRACK_INFO_RETRY_MS     400     // still the old title: ask again
+#define TRACK_INFO_MAX_RETRIES  3
+#define TRACK_INFO_TIMEOUT_MS   2500    // publish what we have if the phone doesn't answer
+#define AVRCP_RETRY_MS          60
+#define AVRCP_GIVE_UP_MS        5000    // controller stuck busy this long: drop queued requests
+#define TRANSPORT_QUEUE_SIZE    8
 
 static void sink_media_command(media_command_t cmd);
 
@@ -283,6 +289,30 @@ static uint32_t last_nav_time;        // last next/previous forwarded to the pho
 static uint32_t last_stop_time;       // last (ignored) stop from the lock screen / head unit
 static btstack_timer_source_t playing_debounce_timer;
 static btstack_timer_source_t play_status_timer;
+
+// A track change in progress: the new playlist position is held back until the new track's
+// info is in. Head units read title/artist/album when they see the position change and don't
+// read them again, so publishing the position first left them one track behind.
+static int      track_info_pending;
+static int      pending_index_step;
+static int      pending_nav_step;      // direction of our last next/previous
+static uint32_t track_change_time;
+static char     prev_title[128];       // the previous track's, to spot stale info
+static char     prev_artist[128];
+static int      info_retries;
+static btstack_timer_source_t track_info_timer;
+static btstack_timer_source_t track_info_timeout_timer;
+
+// BTstack's AVRCP controller runs one request at a time and rejects (COMMAND_DISALLOWED)
+// anything sent meanwhile. That silently dropped the play-status requests (so no song time)
+// and could drop button presses. Everything goes through this queue and is retried.
+static uint8_t  transport_queue[TRANSPORT_QUEUE_SIZE];   // media_command_t, in order
+static unsigned transport_head;
+static unsigned transport_count;
+static int      want_info;
+static int      want_play_status;
+static uint32_t avrcp_busy_since;
+static btstack_timer_source_t avrcp_retry_timer;
 
 static int media_is_playing(void){
     return remote_playing || a2dp_connection.playing;
@@ -314,6 +344,88 @@ static void reset_track_info(void){
     cur_title[0] = cur_artist[0] = cur_album[0] = 0;
     cur_duration_ms = 0;
     position_set(0, 0);
+}
+
+static void avrcp_pump(void);
+
+static void avrcp_retry_handler(btstack_timer_source_t * ts){
+    UNUSED(ts);
+    avrcp_pump();
+}
+
+static void avrcp_queue_reset(void){
+    transport_count = 0;
+    want_info = 0;
+    want_play_status = 0;
+    avrcp_busy_since = 0;
+    btstack_run_loop_remove_timer(&avrcp_retry_timer);
+}
+
+// the controller is busy with an earlier request: try again shortly
+static void avrcp_wait(void){
+    uint32_t now = btstack_run_loop_get_time_ms();
+    if (avrcp_busy_since == 0) avrcp_busy_since = now;
+    if (now - avrcp_busy_since > AVRCP_GIVE_UP_MS){
+        log_error("AVRCP: controller busy for %u s, dropping queued requests", AVRCP_GIVE_UP_MS / 1000);
+        avrcp_queue_reset();
+        return;
+    }
+    btstack_run_loop_remove_timer(&avrcp_retry_timer);
+    btstack_run_loop_set_timer_handler(&avrcp_retry_timer, &avrcp_retry_handler);
+    btstack_run_loop_set_timer(&avrcp_retry_timer, AVRCP_RETRY_MS);
+    btstack_run_loop_add_timer(&avrcp_retry_timer);
+}
+
+static uint8_t avrcp_send_transport(uint8_t cmd, uint16_t cid){
+    switch ((media_command_t) cmd){
+        case MEDIA_CMD_PLAY:     return avrcp_controller_play(cid);
+        case MEDIA_CMD_PAUSE:    return avrcp_controller_pause(cid);
+        case MEDIA_CMD_NEXT:     return avrcp_controller_forward(cid);
+        case MEDIA_CMD_PREVIOUS: return avrcp_controller_backward(cid);
+        default:                 return ERROR_CODE_SUCCESS;
+    }
+}
+
+// send what is waiting, in order: button presses, then track info, then play status
+static void avrcp_pump(void){
+    uint16_t cid = avrcp_connection.avrcp_cid;
+    if (!cid){
+        avrcp_queue_reset();
+        return;
+    }
+    uint8_t status;
+    while (transport_count){
+        status = avrcp_send_transport(transport_queue[transport_head], cid);
+        if (status == ERROR_CODE_COMMAND_DISALLOWED){ avrcp_wait(); return; }
+        if (status != ERROR_CODE_SUCCESS) log_error("AVRCP: command %u failed: 0x%02x", transport_queue[transport_head], status);
+        transport_head = (transport_head + 1) % TRANSPORT_QUEUE_SIZE;
+        transport_count--;
+        avrcp_busy_since = 0;
+    }
+    if (want_info){
+        status = avrcp_controller_get_now_playing_info(cid);
+        if (status == ERROR_CODE_COMMAND_DISALLOWED){ avrcp_wait(); return; }
+        want_info = 0;
+        avrcp_busy_since = 0;
+    }
+    if (want_play_status){
+        status = avrcp_controller_get_play_status(cid);
+        if (status == ERROR_CODE_COMMAND_DISALLOWED){ avrcp_wait(); return; }
+        want_play_status = 0;
+        avrcp_busy_since = 0;
+    }
+}
+
+static void avrcp_queue_transport(media_command_t cmd){
+    if (transport_count == TRANSPORT_QUEUE_SIZE) return;     // button mashing: drop extras
+    transport_queue[(transport_head + transport_count) % TRANSPORT_QUEUE_SIZE] = (uint8_t) cmd;
+    transport_count++;
+    avrcp_pump();
+}
+
+static void avrcp_request_info(void){
+    want_info = 1;
+    avrcp_pump();
 }
 
 static void queue_index_step(int step){
@@ -353,6 +465,7 @@ static int media_ensure_ready(void){
 // publish everything we know: the app's status file always, iOS when car controls are on
 static void media_publish(void){
     sink_status_set_timing(cur_duration_ms, position_now_ms(), position_running);
+    if (track_info_pending) return;      // published together with the new track's info
     if (!(media_state > 0 && media_controls_enabled && a2dp_connection.connected)) return;
     media_now_playing_t np;
     np.title       = cur_title;
@@ -419,7 +532,8 @@ static void media_playing_changed(void){
 }
 
 static void request_play_status(void){
-    if (avrcp_connection.avrcp_cid) avrcp_controller_get_play_status(avrcp_connection.avrcp_cid);
+    want_play_status = 1;
+    avrcp_pump();
 }
 
 static void play_status_timer_handler(btstack_timer_source_t * ts){
@@ -436,16 +550,67 @@ static void start_play_status_polling(void){
     btstack_run_loop_add_timer(&play_status_timer);
 }
 
+static void finish_track_change(void){
+    btstack_run_loop_remove_timer(&track_info_timer);
+    btstack_run_loop_remove_timer(&track_info_timeout_timer);
+    if (!track_info_pending) return;
+    track_info_pending = 0;
+    queue_index_step(pending_index_step);
+    pending_index_step = 0;
+    log_info("track %u: '%s' by '%s'%s%s, length %u:%02u", queue_index + 1, cur_title, cur_artist,
+             cur_album[0] ? " on " : "", cur_album, cur_duration_ms / 60000, (cur_duration_ms / 1000) % 60);
+    media_publish();          // new position together with the new title / artist / album / length
+    request_play_status();    // and the exact elapsed time
+}
+
+static void track_info_request_handler(btstack_timer_source_t * ts){
+    UNUSED(ts);
+    if (track_info_pending) avrcp_request_info();
+}
+
+static void track_info_timeout_handler(btstack_timer_source_t * ts){
+    UNUSED(ts);
+    if (!track_info_pending) return;
+    log_info("track: no updated info from the phone in time, publishing what we have");
+    finish_track_change();
+}
+
+static void schedule_track_info_request(uint32_t delay_ms){
+    btstack_run_loop_remove_timer(&track_info_timer);
+    btstack_run_loop_set_timer_handler(&track_info_timer, &track_info_request_handler);
+    btstack_run_loop_set_timer(&track_info_timer, delay_ms);
+    btstack_run_loop_add_timer(&track_info_timer);
+}
+
+static void cancel_track_change(void){
+    track_info_pending = 0;
+    pending_index_step = 0;
+    pending_nav_step = 0;
+    btstack_run_loop_remove_timer(&track_info_timer);
+    btstack_run_loop_remove_timer(&track_info_timeout_timer);
+}
+
 // the phone reports a new track
 static void media_track_changed(void){
-    // right after our next/previous it is that command (index already moved), otherwise the
-    // phone moved on by itself because the song ended
-    if (now_ms() - last_nav_time > NAV_SETTLE_MS) queue_index_step(+1);
-    reset_track_info();
-    position_set(0, media_is_playing());
-    if (avrcp_connection.avrcp_cid) avrcp_controller_get_now_playing_info(avrcp_connection.avrcp_cid);
-    request_play_status();
-    // published once the new title arrives
+    // right after our next/previous it is that command, otherwise the song ended by itself
+    int step = (pending_nav_step && now_ms() - last_nav_time <= NAV_SETTLE_MS) ? pending_nav_step : +1;
+    pending_nav_step = 0;
+    if (!track_info_pending){
+        btstack_strcpy(prev_title, sizeof(prev_title), cur_title);
+        btstack_strcpy(prev_artist, sizeof(prev_artist), cur_artist);
+        pending_index_step = 0;
+    }
+    pending_index_step += step;
+    track_info_pending = 1;
+    info_retries = 0;
+    track_change_time = now_ms();
+    cur_duration_ms = 0;                     // comes with the new track's info
+    position_set(0, media_is_playing());     // the new track starts now
+    schedule_track_info_request(TRACK_INFO_DELAY_MS);
+    btstack_run_loop_remove_timer(&track_info_timeout_timer);
+    btstack_run_loop_set_timer_handler(&track_info_timeout_timer, &track_info_timeout_handler);
+    btstack_run_loop_set_timer(&track_info_timeout_timer, TRACK_INFO_TIMEOUT_MS);
+    btstack_run_loop_add_timer(&track_info_timeout_timer);
 }
 
 // remote command from the lock screen / car head unit -> forward to the phone
@@ -464,27 +629,24 @@ static void sink_media_command(media_command_t cmd){
     }
     switch (cmd){
         case MEDIA_CMD_PLAY:
-            avrcp_controller_play(cid);
-            break;
         case MEDIA_CMD_PAUSE:
-            avrcp_controller_pause(cid);
+            avrcp_queue_transport(cmd);
             break;
         case MEDIA_CMD_TOGGLE:
-            if (media_is_playing()) avrcp_controller_pause(cid); else avrcp_controller_play(cid);
+            avrcp_queue_transport(media_is_playing() ? MEDIA_CMD_PAUSE : MEDIA_CMD_PLAY);
             break;
         case MEDIA_CMD_NEXT:
-            avrcp_controller_forward(cid);
+            // the playlist position moves when the phone reports the new track (with its info)
+            avrcp_queue_transport(MEDIA_CMD_NEXT);
+            pending_nav_step = +1;
             last_nav_time = now_ms();
-            queue_index_step(+1);              // show the head unit the move right away
-            position_set(0, media_is_playing());
-            media_publish();
             break;
         case MEDIA_CMD_PREVIOUS:
-            avrcp_controller_backward(cid);
-            if (position_now_ms() < PREVIOUS_RESTARTS_MS) queue_index_step(-1);
+            // the phone goes back a track (-> track changed) or restarts this one
+            avrcp_queue_transport(MEDIA_CMD_PREVIOUS);
+            pending_nav_step = -1;
             last_nav_time = now_ms();
-            position_set(0, media_is_playing());
-            media_publish();
+            request_play_status();            // re-sync the time if it just restarted
             break;
         default:
             break;
@@ -506,8 +668,8 @@ static void autoplay_timer_handler(btstack_timer_source_t * ts){
         log_info("auto play: phone is already playing");
         return;
     }
-    uint8_t status = avrcp_controller_play(avrcp_connection.avrcp_cid);
-    log_info("auto play: sending Play -> status 0x%02x", status);
+    log_info("auto play: sending Play");
+    avrcp_queue_transport(MEDIA_CMD_PLAY);
 }
 
 static void autoplay_start(void){
@@ -916,6 +1078,7 @@ static void a2dp_sink_packet_handler(uint8_t packet_type, uint16_t channel, uint
             reconnect_attempts = 0;
             remember_device(address, NULL);
             reset_track_info();
+            cancel_track_change();
             queue_index = QUEUE_START_INDEX;
             published_playing = 0;
             last_nav_time = last_stop_time = 0;
@@ -987,6 +1150,7 @@ static void a2dp_sink_packet_handler(uint8_t packet_type, uint16_t channel, uint
             btstack_run_loop_remove_timer(&avrcp_connect_timer);
             media_processing_close();
             reset_track_info();
+            cancel_track_change();
             published_playing = 0;
             btstack_run_loop_remove_timer(&playing_debounce_timer);
             btstack_run_loop_remove_timer(&play_status_timer);
@@ -1022,6 +1186,8 @@ static void avrcp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
             avrcp_connection.avrcp_cid = 0;
             btstack_run_loop_remove_timer(&autoplay_timer);
             btstack_run_loop_remove_timer(&play_status_timer);
+            avrcp_queue_reset();
+            cancel_track_change();
             break;
         default:
             break;
@@ -1045,7 +1211,7 @@ static void avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channe
         case AVRCP_SUBEVENT_GET_CAPABILITY_EVENT_ID_DONE:
             avrcp_controller_enable_notification(avrcp_connection.avrcp_cid, AVRCP_NOTIFICATION_EVENT_PLAYBACK_STATUS_CHANGED);
             avrcp_controller_enable_notification(avrcp_connection.avrcp_cid, AVRCP_NOTIFICATION_EVENT_TRACK_CHANGED);
-            avrcp_controller_get_now_playing_info(avrcp_connection.avrcp_cid);
+            avrcp_request_info();
             request_play_status();
             start_play_status_polling();
             break;
@@ -1053,7 +1219,7 @@ static void avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channe
             if (avrcp_subevent_notification_track_changed_get_command_type(packet) == AVRCP_CTYPE_RESPONSE_CHANGED_STABLE){
                 media_track_changed();
             } else {
-                avrcp_controller_get_now_playing_info(avrcp_connection.avrcp_cid);   // first report
+                avrcp_request_info();     // first report after registering
             }
             break;
         case AVRCP_SUBEVENT_NOTIFICATION_PLAYBACK_STATUS_CHANGED:
@@ -1062,6 +1228,10 @@ static void avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channe
             request_play_status();     // exact position at the pause / resume
             break;
         case AVRCP_SUBEVENT_PLAY_STATUS: {
+            if (track_info_pending){        // may still describe the old track; asked again after
+                avrcp_pump();
+                break;
+            }
             uint32_t length   = avrcp_subevent_play_status_get_song_length(packet);
             uint32_t position = avrcp_subevent_play_status_get_song_position(packet);
             uint8_t  status   = avrcp_subevent_play_status_get_play_status(packet);
@@ -1072,12 +1242,32 @@ static void avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channe
                 if (playing != remote_playing){
                     remote_playing = playing;
                     media_playing_changed();
+                    avrcp_pump();
                     break;
                 }
             }
             media_publish();
+            avrcp_pump();
             break;
         }
+        case AVRCP_SUBEVENT_NOW_PLAYING_INFO_DONE:
+            if (track_info_pending){
+                int stale = strcmp(cur_title, prev_title) == 0 && strcmp(cur_artist, prev_artist) == 0;
+                if (stale && info_retries < TRACK_INFO_MAX_RETRIES){
+                    info_retries++;      // the phone hasn't updated its info yet: ask again
+                    schedule_track_info_request(TRACK_INFO_RETRY_MS);
+                } else {
+                    finish_track_change();
+                }
+            } else {
+                media_publish();
+                request_play_status();
+            }
+            avrcp_pump();
+            break;
+        case AVRCP_SUBEVENT_OPERATION_COMPLETE:
+            avrcp_pump();       // a button press went through: send the next queued request
+            break;
         case AVRCP_SUBEVENT_NOW_PLAYING_TITLE_INFO:
             copy_avrcp_value(value, sizeof(value), avrcp_subevent_now_playing_title_info_get_value(packet),
                              avrcp_subevent_now_playing_title_info_get_value_len(packet));

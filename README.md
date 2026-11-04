@@ -87,7 +87,7 @@ Then, inside this folder:
 make package FINALPACKAGE=1
 ```
 
-This produces `packages/local.a2dpsink_0.4.4_iphoneos-arm.deb`.
+This produces `packages/local.a2dpsink_0.4.5_iphoneos-arm.deb`.
 
 ## Install
 
@@ -133,7 +133,10 @@ kept awake. The screen can turn off, but the device won't sleep, so keep it plug
   iPod-mode head units only send next/previous when they think the current playlist has
   another track; on a single track (what the receiver reported before 0.4.4) they send
   *stop* instead. The receiver now reports a long playlist with the current song in the
-  middle, so next/previous come through. A *stop* is never passed on to the phone.
+  middle, so next/previous come through — that's why the head unit shows something like
+  "song 107 of 9999". A *stop* is never passed on to the phone. The track number only
+  moves once the phone has sent the new song's title, artist, album and length, so the
+  head unit always shows the song that is actually playing.
 
   If the head unit still starts the iPod's **Music app** (some do after a track change or
   when you switch to the USB source), the receiver notices, pauses Music and takes the
