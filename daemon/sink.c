@@ -241,6 +241,7 @@ static int auto_play;
 static int autoplay_done;
 static int autoplay_retries;
 static int remote_playing;             // from AVRCP playback status notifications
+static int remote_status_known;        // the phone has reported its play status at least once
 
 // --- media controls / Now Playing (lock screen + car/USB transport buttons) ---
 //
@@ -261,6 +262,12 @@ static int remote_playing;             // from AVRCP playback status notificatio
 #define NAV_SETTLE_MS           2500    // a track change this soon after next/prev is that command
 #define STOP_AS_SKIP_MS         2500    // "stop" + the Music app starting = the head unit's "next"
 #define NOT_PLAYING_DEBOUNCE_MS 1500
+#define EXPLICIT_PAUSE_MS       3000    // a pause the user asked for is shown at once
+#define STATE_CHECK_DELAY_MS    700     // ask the phone for its state after play/pause
+#define TIME_REFRESH_MS         1000
+#define HEADUNIT_KICK_DELAY_MS  1500    // after the audio started
+#define HEADUNIT_KICK_GAP_MS    10000
+#define HEADUNIT_KICK_WAIT_MS   30000   // give up if the audio doesn't start in this time
 #define TRACK_INFO_DELAY_MS     250     // phones update their metadata just after "track changed"
 #define TRACK_INFO_RETRY_MS     400     // still the old title: ask again
 #define TRACK_INFO_MAX_RETRIES  3
@@ -287,6 +294,14 @@ static uint32_t queue_index = QUEUE_START_INDEX;
 static int      published_playing;    // debounced play state shown to iOS
 static uint32_t last_nav_time;        // last next/previous forwarded to the phone
 static uint32_t last_stop_time;       // last (ignored) stop from the lock screen / head unit
+static uint32_t last_pause_cmd_time;  // last pause the user asked for
+static int      play_status_logged;   // logged the phone's timing for this track
+static int      kick_done;            // announced the track once for this connection
+static uint32_t last_kick_time;
+static uint32_t kick_deadline;
+static btstack_timer_source_t state_check_timer;
+static btstack_timer_source_t time_refresh_timer;
+static btstack_timer_source_t headunit_kick_timer;
 static btstack_timer_source_t playing_debounce_timer;
 static btstack_timer_source_t play_status_timer;
 
@@ -315,7 +330,11 @@ static uint32_t avrcp_busy_since;
 static btstack_timer_source_t avrcp_retry_timer;
 
 static int media_is_playing(void){
-    return remote_playing || a2dp_connection.playing;
+    // The phone's own play status wins. The Bluetooth audio stream can stay open for seconds
+    // after a pause (on some phones for good), so "stream open" made play/pause send "pause"
+    // again and again and showed "playing" to iOS and the head unit.
+    if (remote_status_known) return remote_playing;
+    return a2dp_connection.playing;
 }
 
 static uint32_t now_ms(void){
@@ -522,6 +541,11 @@ static void media_playing_changed(void){
         media_publish();
         return;
     }
+    if (published_playing && last_pause_cmd_time && now_ms() - last_pause_cmd_time < EXPLICIT_PAUSE_MS){
+        published_playing = 0;           // the user paused: show it right away
+        media_publish();
+        return;
+    }
     if (published_playing){
         btstack_run_loop_set_timer_handler(&playing_debounce_timer, &playing_debounce_handler);
         btstack_run_loop_set_timer(&playing_debounce_timer, NOT_PLAYING_DEBOUNCE_MS);
@@ -534,6 +558,63 @@ static void media_playing_changed(void){
 static void request_play_status(void){
     want_play_status = 1;
     avrcp_pump();
+}
+
+static void state_check_handler(btstack_timer_source_t * ts){
+    UNUSED(ts);
+    request_play_status();
+}
+
+// after play / pause: ask the phone what it is doing now, don't wait for its notification
+static void schedule_state_check(void){
+    btstack_run_loop_remove_timer(&state_check_timer);
+    btstack_run_loop_set_timer_handler(&state_check_timer, &state_check_handler);
+    btstack_run_loop_set_timer(&state_check_timer, STATE_CHECK_DELAY_MS);
+    btstack_run_loop_add_timer(&state_check_timer);
+}
+
+// Re-publish the elapsed time every second while playing. The lock screen extrapolates it
+// itself, but head units can be handed the last published value, which kept the Lancer at 0.
+static void time_refresh_handler(btstack_timer_source_t * ts){
+    if (!a2dp_connection.connected) return;
+    if (published_playing && !track_info_pending && media_state > 0 && media_controls_enabled){
+        media_controls_refresh();
+    }
+    btstack_run_loop_set_timer(ts, TIME_REFRESH_MS);
+    btstack_run_loop_add_timer(ts);
+}
+
+static void start_time_refresh(void){
+    btstack_run_loop_remove_timer(&time_refresh_timer);
+    btstack_run_loop_set_timer_handler(&time_refresh_timer, &time_refresh_handler);
+    btstack_run_loop_set_timer(&time_refresh_timer, TIME_REFRESH_MS);
+    btstack_run_loop_add_timer(&time_refresh_timer);
+}
+
+// iPod-mode head units start their audio input when the iPod announces a new track - that's
+// why the sound only came on after pressing next. Once our audio runs, announce the current
+// track as a new one (playlist position +1, same song).
+static void headunit_kick_handler(btstack_timer_source_t * ts){
+    if (!a2dp_connection.connected || !(media_state > 0 && media_controls_enabled)) return;
+    if (track_info_pending || !audio_stream_started){
+        if ((int32_t) (now_ms() - kick_deadline) > 0) return;     // audio never started: skip
+        btstack_run_loop_set_timer(ts, 500);
+        btstack_run_loop_add_timer(ts);
+        return;
+    }
+    log_info("media: announcing the track to the head unit so it starts its audio");
+    last_kick_time = now_ms();
+    queue_index_step(+1);
+    media_publish();
+}
+
+static void headunit_kick_schedule(void){
+    if (last_kick_time && now_ms() - last_kick_time < HEADUNIT_KICK_GAP_MS) return;
+    kick_deadline = now_ms() + HEADUNIT_KICK_WAIT_MS;
+    btstack_run_loop_remove_timer(&headunit_kick_timer);
+    btstack_run_loop_set_timer_handler(&headunit_kick_timer, &headunit_kick_handler);
+    btstack_run_loop_set_timer(&headunit_kick_timer, HEADUNIT_KICK_DELAY_MS);
+    btstack_run_loop_add_timer(&headunit_kick_timer);
 }
 
 static void play_status_timer_handler(btstack_timer_source_t * ts){
@@ -557,6 +638,7 @@ static void finish_track_change(void){
     track_info_pending = 0;
     queue_index_step(pending_index_step);
     pending_index_step = 0;
+    play_status_logged = 0;
     log_info("track %u: '%s' by '%s'%s%s, length %u:%02u", queue_index + 1, cur_title, cur_artist,
              cur_album[0] ? " on " : "", cur_album, cur_duration_ms / 60000, (cur_duration_ms / 1000) % 60);
     media_publish();          // new position together with the new title / artist / album / length
@@ -630,11 +712,15 @@ static void sink_media_command(media_command_t cmd){
     switch (cmd){
         case MEDIA_CMD_PLAY:
         case MEDIA_CMD_PAUSE:
-            avrcp_queue_transport(cmd);
+        case MEDIA_CMD_TOGGLE: {
+            media_command_t c = cmd;
+            if (cmd == MEDIA_CMD_TOGGLE) c = media_is_playing() ? MEDIA_CMD_PAUSE : MEDIA_CMD_PLAY;
+            log_info("media: %s", c == MEDIA_CMD_PAUSE ? "pause" : "play");
+            if (c == MEDIA_CMD_PAUSE) last_pause_cmd_time = now_ms();
+            avrcp_queue_transport(c);
+            schedule_state_check();
             break;
-        case MEDIA_CMD_TOGGLE:
-            avrcp_queue_transport(media_is_playing() ? MEDIA_CMD_PAUSE : MEDIA_CMD_PLAY);
-            break;
+        }
         case MEDIA_CMD_NEXT:
             // the playlist position moves when the phone reports the new track (with its info)
             avrcp_queue_transport(MEDIA_CMD_NEXT);
@@ -677,6 +763,7 @@ static void autoplay_start(void){
     autoplay_done = 0;
     autoplay_retries = 0;
     remote_playing = 0;
+    remote_status_known = 0;
     if (!auto_play) return;
     btstack_run_loop_set_timer_handler(&autoplay_timer, &autoplay_timer_handler);
     btstack_run_loop_set_timer(&autoplay_timer, AUTOPLAY_DELAY_MS);
@@ -775,9 +862,13 @@ static void stats_timer_handler(btstack_timer_source_t * ts){
     int problems = new_underruns || stat_dropped_sbc || stat_trims || new_reclaims;
     if (audio_stream_started && (problems || stat_ticks % STATS_HEALTH_TICKS == 0)){
         int32_t total = (int32_t) (sink_pcm_frames_available() + btstack_audio_ios_get_queued_frames());
-        log_info("audio: %s last %u s: %u dropouts, %u SBC frames dropped, %u skips, %u taken back from other apps; buffered %u ms",
+        uint32_t pos = position_now_ms();
+        char song[24];      // log_info takes a limited number of arguments
+        snprintf(song, sizeof(song), "%u:%02u/%u:%02u", pos / 60000, (pos / 1000) % 60,
+                 cur_duration_ms / 60000, (cur_duration_ms / 1000) % 60);
+        log_info("audio: %s last %u s: %u dropouts, %u SBC frames dropped, %u skips, %u taken back from other apps; buffered %u ms; song %s",
                  problems ? "PROBLEMS" : "ok,", STATS_INTERVAL_MS / 1000, new_underruns,
-                 stat_dropped_sbc, stat_trims, new_reclaims, frames_to_ms(total));
+                 stat_dropped_sbc, stat_trims, new_reclaims, frames_to_ms(total), song);
     }
     stat_dropped_sbc = 0;
     stat_trims = 0;
@@ -811,7 +902,9 @@ static void audio_before_reclaim(void){
 // Playing again: re-publish the track so we are the Now Playing app again and the head unit's
 // buttons come back to us.
 static void audio_after_reclaim(void){
-    if (a2dp_connection.connected) media_publish();
+    if (!a2dp_connection.connected) return;
+    media_publish();
+    headunit_kick_schedule();     // the head unit may have switched to the Music app's audio
 }
 
 static void media_processing_init(media_codec_configuration_sbc_t * configuration){
@@ -863,6 +956,10 @@ static void keepalive_stop(void){
 static void media_processing_start(void){
     if (!media_initialized) return;
     audio_stream_started = 1;
+    if (!kick_done){
+        kick_done = 1;
+        headunit_kick_schedule();
+    }
     total_avg = (int32_t) sink_pcm_frames_available();
     log_info("audio: starting playback with %u ms buffered", frames_to_ms(total_avg));
     if (keepalive_active){
@@ -1081,7 +1178,11 @@ static void a2dp_sink_packet_handler(uint8_t packet_type, uint16_t channel, uint
             cancel_track_change();
             queue_index = QUEUE_START_INDEX;
             published_playing = 0;
-            last_nav_time = last_stop_time = 0;
+            last_nav_time = last_stop_time = last_pause_cmd_time = 0;
+            play_status_logged = 0;
+            kick_done = 0;
+            last_kick_time = 0;
+            start_time_refresh();
             sink_status_set_state(SINK_STATE_CONNECTED);
             sink_status_set_remote(bd_addr_to_str(address), "");
             gap_remote_name_request(address, 0x01, 0);
@@ -1152,6 +1253,9 @@ static void a2dp_sink_packet_handler(uint8_t packet_type, uint16_t channel, uint
             reset_track_info();
             cancel_track_change();
             published_playing = 0;
+            btstack_run_loop_remove_timer(&time_refresh_timer);
+            btstack_run_loop_remove_timer(&headunit_kick_timer);
+            btstack_run_loop_remove_timer(&state_check_timer);
             btstack_run_loop_remove_timer(&playing_debounce_timer);
             btstack_run_loop_remove_timer(&play_status_timer);
             media_apply_active();
@@ -1224,6 +1328,7 @@ static void avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channe
             break;
         case AVRCP_SUBEVENT_NOTIFICATION_PLAYBACK_STATUS_CHANGED:
             remote_playing = avrcp_subevent_notification_playback_status_changed_get_play_status(packet) == AVRCP_PLAYBACK_STATUS_PLAYING;
+            remote_status_known = 1;
             media_playing_changed();
             request_play_status();     // exact position at the pause / resume
             break;
@@ -1237,9 +1342,20 @@ static void avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channe
             uint8_t  status   = avrcp_subevent_play_status_get_play_status(packet);
             if (length != 0 && length != 0xFFFFFFFFu) cur_duration_ms = length;
             if (position != 0xFFFFFFFFu) position_set(position, media_is_playing());
+            if (!play_status_logged){
+                play_status_logged = 1;
+                if (length != 0 && length != 0xFFFFFFFFu){
+                    log_info("track time from the phone: %u:%02u of %u:%02u, status %u",
+                             position / 60000, (position / 1000) % 60, length / 60000, (length / 1000) % 60, status);
+                } else {
+                    log_info("track time from the phone: length unknown (0x%08x), status %u", length, status);
+                }
+            }
             if (status == AVRCP_PLAYBACK_STATUS_PLAYING || status == AVRCP_PLAYBACK_STATUS_PAUSED || status == AVRCP_PLAYBACK_STATUS_STOPPED){
                 int playing = status == AVRCP_PLAYBACK_STATUS_PLAYING;
-                if (playing != remote_playing){
+                int known_before = remote_status_known;
+                remote_status_known = 1;
+                if (playing != remote_playing || !known_before){
                     remote_playing = playing;
                     media_playing_changed();
                     avrcp_pump();

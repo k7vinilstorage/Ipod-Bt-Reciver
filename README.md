@@ -87,7 +87,7 @@ Then, inside this folder:
 make package FINALPACKAGE=1
 ```
 
-This produces `packages/local.a2dpsink_0.4.5_iphoneos-arm.deb`.
+This produces `packages/local.a2dpsink_0.4.6_iphoneos-arm.deb`.
 
 ## Install
 
@@ -122,7 +122,8 @@ kept awake. The screen can turn off, but the device won't sleep, so keep it plug
   starts working again. The app shows *Reconnecting to …* while it tries.
 - **Auto Play on Connect** (off by default): as soon as the phone connects, the iPod
   sends it a *Play* command over AVRCP, so the music starts by itself. It only does this
-  once per connection, and not if the phone is already playing.
+  once per connection, and not if the phone is already playing. **Turn it on for the car:**
+  with Only While Charging, the music then starts when you turn the ignition on.
 - **Lock Screen & Car Controls** (on by default): while connected, the receiver acts like a
   music app (Spotify, YouTube Music, …) on the iPod. It is the system "Now Playing" app
   and publishes the phone's track — title, artist, album, duration and elapsed time — so
@@ -137,6 +138,11 @@ kept awake. The screen can turn off, but the device won't sleep, so keep it plug
   "song 107 of 9999". A *stop* is never passed on to the phone. The track number only
   moves once the phone has sent the new song's title, artist, album and length, so the
   head unit always shows the song that is actually playing.
+
+  Head units in iPod mode only switch their audio on when the iPod announces a new
+  track (that's why the sound used to come on only after pressing next). Once the
+  phone's audio is playing after it connects, the receiver announces the current song
+  once more, so the song number goes up by one at the start — that's expected.
 
   If the head unit still starts the iPod's **Music app** (some do after a track change or
   when you switch to the USB source), the receiver notices, pauses Music and takes the
