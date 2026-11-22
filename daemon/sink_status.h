@@ -41,6 +41,10 @@ void sink_status_set_media(const char * state);
 void sink_status_set_timing(uint32_t duration_ms, uint32_t position_ms, int playing);
 // music service: "off", "running", "yielded" (another app has the audio) or "battery"
 void sink_status_set_service(const char * state);
+// free space on the iPod's data partition in MB, -1 = unknown
+void sink_status_set_free_storage(long megabytes);
+// iOS audio output: "ok", or "stuck" while our audio queue doesn't play although it should
+void sink_status_set_audio_output(const char * state);
 
 // write the status file now (otherwise written by the setters)
 void sink_status_flush(void);

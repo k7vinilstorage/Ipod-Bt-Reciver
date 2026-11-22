@@ -25,11 +25,14 @@
 
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <notify.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mount.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -50,6 +53,15 @@
 #include "sink_status.h"
 
 #define HCI_DUMP_PATH          "/tmp/a2dpsink.pklg"
+#define HCI_DUMP_MAX_PACKETS   50000    // the packet log starts over after this many
+
+// The launchd job writes stdout/stderr to this file. Kept small: it used to grow without a
+// limit, and a burst of errors could write megabytes per second until the iPod was full.
+#define LOG_PATH               "/var/log/a2dpsinkd.log"
+#define LOG_MAX_BYTES          (1024 * 1024)        // then it moves to a2dpsinkd.log.1
+#define LOG_LINES_PER_SECOND   200                  // more are counted, not written
+#define LOW_STORAGE_MB         200
+#define STORAGE_CHECK_MS       60000
 #define POLL_INTERVAL_MS       1000
 #define IDLE_POLL_INTERVAL_MS  5000     // fallback; power changes also arrive via notify
 #define POWER_LOSS_GRACE_MS    5000     // ignore short cable wiggles
@@ -102,6 +114,102 @@ static int setting_auto_reconnect = 1;
 static int setting_auto_play;
 static int setting_media_controls = 1;   // lock screen + car/USB buttons, on by default
 static int setting_music_service;        // stay the playing music app all the time
+
+// --- log: rate limit and size limit ---
+
+static const hci_dump_t * log_output;
+static uint32_t log_window_start;
+static unsigned int log_lines;
+static unsigned int log_suppressed;
+
+static void log_emit(int level, const char * format, ...){
+    va_list args;
+    va_start(args, format);
+    log_output->log_message(level, format, args);
+    va_end(args);
+}
+
+static void limited_log_message(int level, const char * format, va_list args){
+    uint32_t now = btstack_run_loop_get_time_ms();
+    if (now - log_window_start >= 1000){
+        if (log_suppressed){
+            log_emit(HCI_DUMP_LOG_LEVEL_ERROR, "log: %u more lines in the last second not written (limit %u per second)",
+                     log_suppressed, LOG_LINES_PER_SECOND);
+        }
+        log_window_start = now;
+        log_lines = 0;
+        log_suppressed = 0;
+    }
+    if (++log_lines > LOG_LINES_PER_SECOND){
+        log_suppressed++;
+        return;
+    }
+    log_output->log_message(level, format, args);
+}
+
+static void limited_log_packet(uint8_t packet_type, uint8_t in, uint8_t * packet, uint16_t len){
+    log_output->log_packet(packet_type, in, packet, len);
+}
+
+static void limited_log_reset(void){
+    if (log_output->reset) log_output->reset();
+}
+
+static const hci_dump_t limited_log = {
+    &limited_log_reset,
+    &limited_log_packet,
+    &limited_log_message,
+};
+
+// Start a new log file once it is LOG_MAX_BYTES, keeping one previous part. A log that is
+// far too big (from older versions) is deleted outright: it may be what filled the iPod.
+static void log_rotate_if_needed(void){
+    struct stat out;
+    if (fstat(STDOUT_FILENO, &out) != 0 || !S_ISREG(out.st_mode)) return;   // a terminal: nothing to do
+    if (out.st_size < LOG_MAX_BYTES) return;
+    struct stat path;
+    if (stat(LOG_PATH, &path) != 0 || path.st_ino != out.st_ino || path.st_dev != out.st_dev) return;
+    fflush(stdout);
+    fflush(stderr);
+    int oversized = out.st_size > 8 * LOG_MAX_BYTES;
+    if (oversized){
+        unlink(LOG_PATH);
+        unlink(LOG_PATH ".1");
+    } else {
+        rename(LOG_PATH, LOG_PATH ".1");
+    }
+    int fd = open(LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+    dup2(fd, STDOUT_FILENO);       // the old file is released here (and its space, if deleted)
+    dup2(fd, STDERR_FILENO);
+    if (fd > STDERR_FILENO) close(fd);
+    printf("a2dpsinkd: new log file, the old one had %lld KB%s\n", (long long) (out.st_size / 1024),
+           oversized ? " and was deleted" : " (kept as a2dpsinkd.log.1)");
+}
+
+// free space on the data partition, in MB (-1 = unknown)
+static long free_storage_mb(void){
+    struct statfs fs;
+    if (statfs("/var/mobile", &fs) != 0) return -1;
+    return (long) (((unsigned long long) fs.f_bavail * (unsigned long long) fs.f_bsize) / (1024ull * 1024ull));
+}
+
+static uint32_t last_storage_check_ms;
+static int storage_warned;
+
+static void check_storage(int force){
+    uint32_t now = btstack_run_loop_get_time_ms();
+    if (!force && last_storage_check_ms && now - last_storage_check_ms < STORAGE_CHECK_MS) return;
+    last_storage_check_ms = now ? now : 1;
+    long mb = free_storage_mb();
+    sink_status_set_free_storage(mb);
+    if (mb >= 0 && mb < LOW_STORAGE_MB && !storage_warned){
+        log_error("a2dpsinkd: only %ld MB of storage left on the iPod; iOS audio misbehaves when it is full", mb);
+        storage_warned = 1;
+    } else if (mb >= LOW_STORAGE_MB){
+        storage_warned = 0;
+    }
+}
 
 // --- helpers ---
 
@@ -233,6 +341,17 @@ static void begin_shutdown(void){
 
 // --- Bluetooth session ---
 
+// The link to the Bluetooth chip can't be used any more (see hci_transport_h4_ipod.c):
+// start over in a fresh process. launchd starts the daemon again within seconds.
+static void transport_failed(const char * reason){
+    if (shutting_down) return;
+    shutting_down = 1;
+    log_error("a2dpsinkd: %s - restarting Bluetooth", reason);
+    sink_status_set_state(SINK_STATE_STARTING);
+    hci_transport_h4_ipod_instance()->close();
+    finish(0);
+}
+
 static void startup_timeout_handler(btstack_timer_source_t * ts){
     UNUSED(ts);
     if (!hci_working) fail("Bluetooth controller did not respond");
@@ -292,6 +411,7 @@ static void start_bluetooth(void){
     hci_set_control(btstack_control_ipod_instance());
     hci_set_link_key_db(btstack_link_key_db_tlv_get_instance(tlv_impl, &tlv_context));
     hci_transport_h4_ipod_set_enforce_wake_device("/dev/btwake");
+    hci_transport_h4_ipod_set_failure_handler(&transport_failed);
 
     hci_event_callback_registration.callback = &hci_event_handler;
     hci_add_event_handler(&hci_event_callback_registration);
@@ -360,6 +480,8 @@ static void evaluate(void){
 }
 
 static void poll_timer_handler(btstack_timer_source_t * ts){
+    log_rotate_if_needed();
+    check_storage(0);
     evaluate();
     if (shutting_down) return;
     btstack_run_loop_set_timer(ts, bluetooth_started ? POLL_INTERVAL_MS : IDLE_POLL_INTERVAL_MS);
@@ -428,6 +550,7 @@ int main(int argc, const char * argv[]){
 
     setvbuf(stdout, NULL, _IOLBF, 0);
     setvbuf(stderr, NULL, _IOLBF, 0);
+    log_rotate_if_needed();          // before anything else is written (and frees a huge old log)
     raise_priority();
 
     mkdir(SINK_DATA_DIR, 0755);
@@ -447,13 +570,16 @@ int main(int argc, const char * argv[]){
     if (hci_dump){
         hci_dump_posix_fs_open(HCI_DUMP_PATH, HCI_DUMP_PACKETLOGGER);
         hci_dump_init(hci_dump_posix_fs_get_instance());
+        hci_dump_set_max_packets(HCI_DUMP_MAX_PACKETS);
         printf("a2dpsinkd: HCI log at %s\n", HCI_DUMP_PATH);
     } else {
         // log_info/log_error go through hci_dump: print them to stdout (launchd log),
-        // but not every HCI packet (audio streaming would flood the log)
-        hci_dump_init(hci_dump_posix_stdout_get_instance());
+        // at most LOG_LINES_PER_SECOND, and not every HCI packet (audio would flood it)
+        log_output = hci_dump_posix_stdout_get_instance();
+        hci_dump_init(&limited_log);
         hci_dump_enable_packet_log(false);
     }
+    check_storage(1);
 
     if (!btstack_control_ipod_is_supported()){
         char msg[96];

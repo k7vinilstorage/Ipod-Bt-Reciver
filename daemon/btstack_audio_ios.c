@@ -59,6 +59,9 @@
 #define RECLAIM_DELAY_MS    250     // let the other app's start settle first
 #define RECLAIM_MAX_DELAY_MS 5000   // backoff limit while we keep losing the audio
 #define RECLAIM_QUIET_MS    10000   // this long without an interruption resets the backoff
+#define WATCHDOG_INTERVAL_MS    1000
+#define WATCHDOG_STALL_MS       3000    // buffers queued, none played for this long: stuck
+#define WATCHDOG_MAX_BACKOFF_MS 60000   // don't hammer an audio system that doesn't respond
 
 static void (*playback_callback)(int16_t * buffer, uint16_t num_samples, const btstack_audio_context_t * context);
 static uint32_t (*available_handler)(void);
@@ -100,6 +103,15 @@ static uint32_t               reclaims;
 static int  (*before_reclaim_handler)(void);
 static void (*after_reclaim_handler)(void);
 
+// stall watchdog: iOS stopped playing our queue without telling us (no interruption)
+static volatile uint32_t      buffers_played;   // counted on the AudioQueue thread
+static btstack_timer_source_t watchdog_timer;
+static uint32_t               watchdog_seen;
+static uint32_t               watchdog_quiet_ms;
+static uint32_t               watchdog_limit_ms = WATCHDOG_STALL_MS;
+static int                    watchdog_stuck;
+static void (*stall_handler)(int stuck);
+
 static AudioQueueBufferRef free_queue_pop(void){
     uint32_t r = free_read;
     if (r == __atomic_load_n(&free_write, __ATOMIC_ACQUIRE)) return NULL;
@@ -112,6 +124,7 @@ static AudioQueueBufferRef free_queue_pop(void){
 static void aq_output_callback(void * user_data, AudioQueueRef aq, AudioQueueBufferRef buffer){
     (void) user_data;
     if (!__atomic_load_n(&stream_running, __ATOMIC_ACQUIRE)) return;
+    __atomic_add_fetch(&buffers_played, 1, __ATOMIC_RELEASE);
     int32_t frames = (int32_t) (buffer->mAudioDataByteSize / stream_format.mBytesPerFrame);
     if (__atomic_load_n(&silence_fill, __ATOMIC_ACQUIRE)){
         // silence: queue it again right away, without the BTstack thread
@@ -242,6 +255,8 @@ static void fallback_timer_handler(btstack_timer_source_t * ts){
     btstack_run_loop_add_timer(ts);
 }
 
+static void watchdog_handler(btstack_timer_source_t * ts);
+
 static int setup_wake_pipe(void){
     if (wake_pipe[0] >= 0) return 0;
     if (pipe(wake_pipe) != 0){
@@ -254,6 +269,10 @@ static int setup_wake_pipe(void){
     btstack_run_loop_set_data_source_handler(&wake_data_source, &wake_handler);
     btstack_run_loop_enable_data_source_callbacks(&wake_data_source, DATA_SOURCE_CALLBACK_READ);
     btstack_run_loop_add_data_source(&wake_data_source);
+    // runs for the life of the process, checks once a second whether iOS plays our buffers
+    btstack_run_loop_set_timer_handler(&watchdog_timer, &watchdog_handler);
+    btstack_run_loop_set_timer(&watchdog_timer, WATCHDOG_INTERVAL_MS);
+    btstack_run_loop_add_timer(&watchdog_timer);
     return 0;
 }
 
@@ -460,6 +479,50 @@ static void reclaim_timer_handler(btstack_timer_source_t * ts){
 }
 #pragma clang diagnostic pop
 
+// iOS can stop playing our queue without an interruption - seen when the iPod's audio system
+// itself got stuck: buffers stay queued and none comes back, so incoming audio only piles up.
+// Rebuild the queue then, backing off so a dead audio system isn't hammered.
+static void watchdog_handler(btstack_timer_source_t * ts){
+    btstack_run_loop_set_timer(ts, WATCHDOG_INTERVAL_MS);
+    btstack_run_loop_add_timer(ts);
+    uint32_t played = __atomic_load_n(&buffers_played, __ATOMIC_ACQUIRE);
+    if (played != watchdog_seen){
+        watchdog_seen = played;
+        watchdog_quiet_ms = 0;
+        watchdog_limit_ms = WATCHDOG_STALL_MS;
+        if (watchdog_stuck){
+            watchdog_stuck = 0;
+            log_info("audio: iOS plays our audio again");
+            if (stall_handler) (*stall_handler)(0);
+        }
+        return;
+    }
+    int expecting = __atomic_load_n(&stream_running, __ATOMIC_ACQUIRE) && !reclaim_pending
+                    && __atomic_load_n(&frames_queued, __ATOMIC_ACQUIRE) > 0;
+    if (!expecting){
+        watchdog_quiet_ms = 0;
+        return;
+    }
+    watchdog_quiet_ms += WATCHDOG_INTERVAL_MS;
+    if (watchdog_quiet_ms < watchdog_limit_ms) return;
+    log_error("audio: iOS stopped playing our audio (nothing played for %u s), restarting the audio output",
+              watchdog_quiet_ms / 1000);
+    watchdog_quiet_ms = 0;
+    watchdog_limit_ms = btstack_min(watchdog_limit_ms * 2, WATCHDOG_MAX_BACKOFF_MS);
+    if (!watchdog_stuck){
+        watchdog_stuck = 1;
+        if (stall_handler) (*stall_handler)(1);
+    }
+    activate_session();
+    tear_down_queue();
+    if (start_queue() != 0){
+        log_error("audio: could not restart the audio output, retrying");
+        schedule_reclaim();
+        return;
+    }
+    if (after_reclaim_handler) (*after_reclaim_handler)();         // be the Now Playing app again
+}
+
 static void ios_audio_stop_stream(void){
     stream_wanted = 0;
     __atomic_store_n(&silence_fill, 0, __ATOMIC_RELEASE);
@@ -529,4 +592,8 @@ int btstack_audio_ios_is_running(void){
 
 int btstack_audio_ios_is_started(void){
     return stream_wanted;
+}
+
+void btstack_audio_ios_set_stall_handler(void (*handler)(int stuck)){
+    stall_handler = handler;
 }

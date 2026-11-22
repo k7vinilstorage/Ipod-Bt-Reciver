@@ -298,10 +298,21 @@ enum { AlertRename = 1, AlertForget = 2 };
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     if (section == SectionReceiver) {
-        if ([self.status[@"state"] isEqualToString:@"error"] && [self.status[@"error"] length]) {
-            return [NSString stringWithFormat:@"%@. Details: /var/log/a2dpsinkd.log", self.status[@"error"]];
+        NSMutableString * warnings = [NSMutableString string];
+        if ([self daemonAlive] && [self enabled]) {
+            NSString * freeText = self.status[@"free_mb"];
+            long long freeMB = freeText.length ? [freeText longLongValue] : -1;
+            if (freeMB >= 0 && freeMB < 200) {
+                [warnings appendFormat:@"⚠️ Only %lld MB of storage left on this iPod. iOS sound (and the volume buttons) stop working properly when it is full: free some space.\n\n", freeMB];
+            }
+            if ([self.status[@"audio_output"] isEqualToString:@"stuck"]) {
+                [warnings appendString:@"⚠️ iOS stopped playing the receiver's audio. The receiver keeps restarting it; if the sound doesn't come back, restart the iPod.\n\n"];
+            }
         }
-        return [NSString stringWithFormat:@"Pair your phone with \"%@\". While the receiver is on, iOS Bluetooth is off and the iPod stays awake.",
+        if ([self.status[@"state"] isEqualToString:@"error"] && [self.status[@"error"] length]) {
+            return [warnings stringByAppendingFormat:@"%@. Details: /var/log/a2dpsinkd.log", self.status[@"error"]];
+        }
+        return [warnings stringByAppendingFormat:@"Pair your phone with \"%@\". While the receiver is on, iOS Bluetooth is off and the iPod stays awake.",
                 [self configuredName]];
     }
     if (section == SectionSettings) {

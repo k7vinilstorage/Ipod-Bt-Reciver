@@ -87,7 +87,7 @@ Then, inside this folder:
 make package FINALPACKAGE=1
 ```
 
-This produces `packages/local.a2dpsink_0.4.7_iphoneos-arm.deb`.
+This produces `packages/local.a2dpsink_0.4.8_iphoneos-arm.deb`.
 
 ## Install
 
@@ -182,7 +182,9 @@ kept awake. The screen can turn off, but the device won't sleep, so keep it plug
 
 ## If it doesn't work
 
-The daemon logs to **`/var/log/a2dpsinkd.log`**. To debug by hand over SSH (as root),
+The daemon logs to **`/var/log/a2dpsinkd.log`** (at most about 1 MB: then it starts a new
+file and keeps the previous one as `a2dpsinkd.log.1`; at most 200 lines per second are
+written). To debug by hand over SSH (as root),
 switch the receiver off in the app, then run it in the foreground with an HCI packet log:
 
 ```bash
@@ -199,7 +201,25 @@ Where things are most likely to break, in order:
 | `socket(PF_NETGRAPH) failed` / `ioctl(... com.apple.uart.bluetooth) failed` | Something still holds the UART. Check `ps ax \| grep -i -e blue -e BTServer` |
 | `Bluetooth controller did not respond` | BlueTool bring-up or UART speed. Check the `BlueTool >` lines and `transport-speed` |
 | Connects but no sound | AudioQueue from a daemon. Look for `AudioQueue…failed` lines |
+| `iOS stopped playing our audio` | The iPod's own audio system is stuck (the volume buttons stop showing the volume too). The receiver keeps restarting its audio; if that doesn't help, free storage (see below) and restart the iPod's audio |
+| `h4: lost sync with the Bluetooth controller` | Bytes from the Bluetooth chip were lost. Now a short gap: the receiver finds the next packet. If it keeps happening it restarts Bluetooth by itself |
 | Stutters | Raise `TARGET_FRAMES` / `START_FRAMES` in `daemon/sink.c` |
+
+**No sound at all on the iPod, volume buttons show nothing:** check the free storage
+(Settings → General → Usage, or `df -h /private/var`). Versions before 0.4.8 could fill the
+iPod with their log after losing sync with the Bluetooth chip (thousands of
+`h4: invalid packet type` lines per second). 0.4.8 deletes such a log by itself when it
+starts; to do it by hand (as root):
+
+```bash
+rm -f /var/log/a2dpsinkd.log /var/log/a2dpsinkd.log.1
+```
+
+Then restart the iPod's audio system (it starts again by itself), or reboot:
+
+```bash
+killall -9 mediaserverd
+```
 
 If iOS Bluetooth stays dead afterwards (for example after a crash), reboot. Or load the
 Apple jobs again by hand:
@@ -215,7 +235,7 @@ launchctl load /System/Library/LaunchDaemons/com.apple.BTServer.plist
 | `daemon/main.c` | Startup, launchd and flag-file handling, signals, shutdown |
 | `daemon/sink.c` | A2DP sink, AVRCP, SBC decode, clock-drift resampling (from BTstack's `a2dp_sink_demo.c`), music service |
 | `daemon/btstack_control_ipod.c` | Stops/starts Apple's Bluetooth, configures the chip with BlueTool |
-| `daemon/hci_transport_h4_ipod.c` | H4 over the netgraph UART socket |
+| `daemon/hci_transport_h4_ipod.c` | H4 over the netgraph UART socket (reader thread, packet checks, finding the next packet after lost bytes) |
 | `daemon/media_controls.m` | Now Playing / lock screen and car-button forwarding (MediaPlayer loaded at runtime) |
 | `daemon/btstack_audio_ios.c` | AudioQueue output (lock-free hand-off between threads, self-refilling silence, taking the audio back) |
 | `daemon/ios9_compat.h` | `clock_gettime` replacement (it only exists on iOS 10+) |

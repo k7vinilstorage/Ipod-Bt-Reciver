@@ -46,4 +46,8 @@ int      btstack_audio_ios_is_running(void);
 // from an interruption, i.e. not running right now).
 int      btstack_audio_ios_is_started(void);
 
+// Watchdog: buffers queued but iOS played none for 3 s -> the queue is rebuilt (backing off)
+// and the handler is told (1); once iOS plays our buffers again it is told (0).
+void     btstack_audio_ios_set_stall_handler(void (*handler)(int stuck));
+
 #endif

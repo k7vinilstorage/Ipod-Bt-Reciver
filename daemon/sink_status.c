@@ -22,6 +22,8 @@ static char artist[128];
 static char reconnecting[64];
 static char media[16];
 static char service[16] = "off";
+static long free_mb = -1;
+static char audio_output[16] = "ok";
 static uint32_t timing_duration_ms;
 static uint32_t timing_position_ms;
 static int      timing_playing;
@@ -54,6 +56,8 @@ void sink_status_flush(void){
     fprintf(f, "reconnecting=%s\n", reconnecting);
     fprintf(f, "media=%s\n", media);
     fprintf(f, "service=%s\n", service);
+    fprintf(f, "free_mb=%ld\n", free_mb);
+    fprintf(f, "audio_output=%s\n", audio_output);
     fprintf(f, "duration_ms=%u\n", timing_duration_ms);
     fprintf(f, "position_ms=%u\n", timing_position_ms);
     fprintf(f, "position_time=%llu\n", timing_stamp_ms);
@@ -126,6 +130,19 @@ void sink_status_set_service(const char * state){
     memcpy(previous, service, sizeof(service));
     copy_clean(service, sizeof(service), state);
     if (strcmp(previous, service) != 0) sink_status_flush();
+}
+
+void sink_status_set_free_storage(long megabytes){
+    if (megabytes == free_mb) return;
+    free_mb = megabytes;
+    sink_status_flush();
+}
+
+void sink_status_set_audio_output(const char * state){
+    char previous[sizeof(audio_output)];
+    memcpy(previous, audio_output, sizeof(audio_output));
+    copy_clean(audio_output, sizeof(audio_output), state);
+    if (strcmp(previous, audio_output) != 0) sink_status_flush();
 }
 
 void sink_status_set_timing(uint32_t duration_ms, uint32_t position_ms, int playing){
