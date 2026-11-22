@@ -1,0 +1,16 @@
+Package: local.a2dpsink
+Version: 0.4.8
+Architecture: iphoneos-arm
+Maintainer: local
+Installed-Size: 468
+Depends: firmware (>= 6.0)
+Filename: debs/local.a2dpsink_0.4.8_iphoneos-arm.deb
+Size: 162406
+MD5sum: aa87c0af7e4895791f822ce332c289f2
+SHA1: 4af965514c46defcee55be4e1356b05324e98ee2
+SHA256: 42a8ff907cfb16d5ccd9b68ed6bc0a90aaaf737eea12c73b5de35df3fa4a46f6
+Section: Utilities
+Description: Turns an iPod touch 5 into a Bluetooth audio receiver (A2DP sink with AVRCP). Built on BTstack.
+Author: local
+Name: BT Receiver (A2DP Sink)
+

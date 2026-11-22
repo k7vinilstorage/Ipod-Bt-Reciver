@@ -1,0 +1,8 @@
+Origin: iPod BT Receiver
+Label: iPod BT Receiver
+Suite: stable
+Version: 1.0
+Codename: ios
+Architectures: iphoneos-arm
+Components: main
+Description: Bluetooth A2DP receiver for a jailbroken iPod touch 5
